@@ -28,8 +28,8 @@
 /* ================================================================
  *  VERSION
  * ================================================================ */
-#define LMK_VERSION   "1.26"
-#define LMK_AUTHOR    "P34"
+#define LMK_VERSION   "1.0"
+#define LMK_AUTHOR    "@fuckyoustan & P34"
 
 /* ================================================================
  *  MEMORY PRESSURE THRESHOLDS
@@ -1464,12 +1464,22 @@ static bool is_screen_off(void) {
     time_t now = time(NULL);
     if (now - last_check < SCREEN_POLL_INTVL_S) return cached;
     last_check = now;
-    FILE *p = popen("dumpsys power 2>/dev/null | grep -o 'mWakefulness=[A-Za-z]*'", "r");
+
+    /* Prioritas: cmd power get-wakefulness (Android 11+, 1 baris output).
+     * Fallback ke dumpsys power | grep untuk Android lama — tetap jauh
+     * lebih ringan dari dumpsys penuh. */
+    FILE *p = popen("cmd power get-wakefulness 2>/dev/null || "
+                    "dumpsys power 2>/dev/null | grep -o 'mWakefulness=[A-Za-z]*'",
+                    "r");
     if (!p) return cached;
     char buf[64] = {0};
-    fgets(buf, sizeof(buf), p); pclose(p);
+    if (!fgets(buf, sizeof(buf), p)) { pclose(p); return cached; }
+    pclose(p);
 
-    cached = strstr(buf, "Asleep") != NULL || strstr(buf, "Dozing") != NULL;
+    cached = strstr(buf, "Asleep") != NULL ||
+             strstr(buf, "Dozing") != NULL ||
+             strstr(buf, "asleep") != NULL ||
+             strstr(buf, "dozing") != NULL;
     return cached;
 }
 
@@ -1479,12 +1489,13 @@ static bool is_doze_active(void) {
     time_t now = time(NULL);
     if (now - last_check < SCREEN_POLL_INTVL_S) return cached;
     last_check = now;
-    FILE *p = popen("dumpsys deviceidle get deep 2>/dev/null", "r");
+    /* cmd deviceidle: sub-perintah resmi, output 1 baris (IDLE/ACTIVE) */
+    FILE *p = popen("cmd deviceidle get deep 2>/dev/null", "r");
     if (!p) return cached;
     char buf[32] = {0};
     fgets(buf, sizeof(buf), p); pclose(p);
     int n = (int)strlen(buf);
-    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' ')) buf[--n] = '\0';
+    while (n > 0 && (buf[n-1]=='\n' || buf[n-1]==' ' || buf[n-1]=='\r')) buf[--n] = '\0';
     cached = strcmp(buf, "IDLE") == 0;
     return cached;
 }
@@ -1795,11 +1806,91 @@ static void check_bounced(const char *name) {
 }
 
 /* ================================================================
+ *  SYSTEM PACKAGE CACHE
+ *  Sumber kebenaran: PackageManager (via `cmd package list packages -s`).
+ *  Jauh lebih akurat daripada prefix hardcoded (com.android.*, dll) di
+ *  ROM OEM mana pun — nama package OEM (mis. com.miui.*, com.samsung.*)
+ *  otomatis terdeteksi tanpa perlu didaftarkan manual.
+ * ================================================================ */
+#define SYSPKG_CACHE_S 300
+static char  **g_syspkg_list  = NULL;
+static int     g_syspkg_count = 0;
+static time_t  g_syspkg_ts    = 0;
+
+static void syspkg_cache_free(void) {
+    for (int i = 0; i < g_syspkg_count; i++) free(g_syspkg_list[i]);
+    free(g_syspkg_list);
+    g_syspkg_list = NULL;
+    g_syspkg_count = 0;
+}
+
+static void load_syspkg_cache(void) {
+    time_t now = time(NULL);
+    if (g_syspkg_ts > 0 && (now - g_syspkg_ts) < SYSPKG_CACHE_S) return;
+    g_syspkg_ts = now;   /* set sebelum popen agar tidak hammer saat gagal */
+
+    FILE *p = popen("cmd package list packages -s 2>/dev/null", "r");
+    if (!p) return;
+
+    int cap = 256, n = 0;
+    char **list = calloc(cap, sizeof(char *));
+    if (!list) { pclose(p); return; }
+
+    char line[256];
+    while (fgets(line, sizeof(line), p)) {
+        if (strncmp(line, "package:", 8) != 0) continue;
+        int len = (int)strlen(line + 8);
+        while (len > 0 && (line[8+len-1]=='\n' || line[8+len-1]=='\r' || line[8+len-1]==' '))
+            len--;
+        if (len <= 0) continue;
+        if (n >= cap) {
+            cap *= 2;
+            char **nl = realloc(list, cap * sizeof(char *));
+            if (!nl) break;
+            list = nl;
+        }
+        list[n] = strndup(line + 8, len);
+        if (list[n]) n++;
+    }
+    pclose(p);
+
+    if (n == 0) { free(list); return; }
+
+    syspkg_cache_free();
+    g_syspkg_list  = list;
+    g_syspkg_count = n;
+    logi("SysPkg: %d system package di-cache via cmd package", n);
+}
+
+static bool is_system_package_cached(const char *name) {
+    if (g_syspkg_count == 0) load_syspkg_cache();
+    if (g_syspkg_count == 0) return false;
+
+    /* Buang suffix ':' (alias proses) */
+    char base[256];
+    strncpy(base, name, 255); base[255] = '\0';
+    char *colon = strchr(base, ':');
+    if (colon) *colon = '\0';
+
+    /* Walk dot-segments: cocokkan exact dulu, lalu induknya
+     * (mis. com.google.android.gms.ui → com.google.android.gms). */
+    char cand[256];
+    strncpy(cand, base, 255); cand[255] = '\0';
+    for (;;) {
+        for (int i = 0; i < g_syspkg_count; i++)
+            if (strcmp(cand, g_syspkg_list[i]) == 0) return true;
+        char *dot = strrchr(cand, '.');
+        if (!dot) return false;
+        *dot = '\0';
+    }
+}
+
+/* ================================================================
  *  SCORE CATEGORY CLASSIFIER
  * ================================================================ */
 static int classify_score_cat(const char *name) {
+    if (strchr(name, '/')) return 0;                 /* native path */
 
-    if (strchr(name, '/')) return 0;
     static const char * const NATIVE_NAMES[] = {
         "zygote","zygote64","webview_zygote","system_server",
         "magiskd","logcat","top","su","lmk_engine",
@@ -1810,20 +1901,20 @@ static int classify_score_cat(const char *name) {
         if (!strcmp(name, NATIVE_NAMES[i])) return 0;
     if (strncmp(name, "media.", 6) == 0) return 0;
 
+    /* Nama tanpa titik & tanpa ':' = binary/daemon native */
     {
         char base[256]; strncpy(base, name, 255); base[255] = '\0';
         char *colon = strchr(base, ':'); if (colon) *colon = '\0';
         if (!strchr(base, '.')) return 0;
     }
 
+    /* Sinyal utama: flag SYSTEM dari PackageManager (universal, akurat) */
+    if (is_system_package_cached(name)) return 1;
+
+    /* Fallback heuristik: hanya untuk package yang belum sempat masuk
+     * cache (mis. system app yang baru di-update sebelum cache reload) */
     if (strncmp(name, "com.android.",  12) == 0) return 1;
     if (strncmp(name, "android.",       8) == 0) return 1;
-    if (strncmp(name, "org.lineageos.", 14) == 0) return 1;
-    if (strncmp(name, "org.protonaosp.",15)== 0) return 1;
-    if (strncmp(name, "io.chaldeaprjkt.",16)== 0) return 1;
-    if (strncmp(name, "co.aospa.",      9) == 0) return 1;
-    if (strncmp(name, "me.phh.",         7) == 0) return 1;
-
     return 2;
 }
 
@@ -1991,31 +2082,32 @@ static void classify_queue_requeue(const char *name, int attempts) {
     g_syscheck_queue_n++;
 }
 
-/* Runs `dumpsys package <pkg>` once and reports whether a parseable
- * flags=[ ... ] line was found and whether it carried SYSTEM. */
+/* Runs `cmd package path <pkg>` (fallback `pm path`) sekali dan
+ * menentukan system/user dari lokasi APK. Jauh lebih ringan daripada
+ * `dumpsys package <pkg>`: output hanya satu/dua baris, bukan ribuan
+ * baris metadata. Tetap memakai PackageManager service yang sama,
+ * jadi akurasi setara. */
 static bool classify_try(const char *pkg, bool *is_system) {
     char cmd[300];
     snprintf(cmd, sizeof(cmd),
-             "/system/bin/dumpsys package %s 2>/dev/null", pkg);
+             "cmd package path %s 2>/dev/null || pm path %s 2>/dev/null",
+             pkg, pkg);
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
 
     bool parsed = false;
     *is_system = false;
-    char line[1024];
+    char line[512];
     while (fgets(line, sizeof(line), fp)) {
-        char *flags = strstr(line, "flags=[");
-        if (!flags) continue;
+        if (strncmp(line, "package:", 8) != 0) continue;
         parsed = true;
-        char *p = flags + 7;
-        while (*p && *p != ']') {
-            while (*p == ' ') p++;
-            char tok[64]; int ti = 0;
-            while (*p && *p != ' ' && *p != ']' && ti < 63) tok[ti++] = *p++;
-            tok[ti] = '\0';
-            if (!strcmp(tok, "SYSTEM")) { *is_system = true; break; }
+        char *path = line + 8;
+        if (strstr(path, "/system/")     || strstr(path, "/system_ext/") ||
+            strstr(path, "/product/")    || strstr(path, "/vendor/")     ||
+            strstr(path, "/odm/")        || strstr(path, "/apex/")) {
+            *is_system = true;
+            break;
         }
-        break; /* only the flags=[ line matters */
     }
     pclose(fp);
     return parsed;
