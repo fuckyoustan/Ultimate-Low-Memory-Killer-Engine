@@ -1,79 +1,76 @@
 #!/system/bin/sh
-# ============================================================
-#  LMK Engine — Magisk Module Installer  (customize.sh)
-#  Author : P34   |   Version : 1.26
-# ============================================================
 
-SKIPUNZIP=1   # We handle extraction ourselves
-
-# ── Banner ──────────────────────────────────────────────────
+ui_print "======================================"
+ui_print "           MODULE INFORMATION          "
+ui_print "======================================"
+ui_print " Name       : $(grep_prop name "${TMPDIR}/module.prop")"
+sleep 0.1
+ui_print " Version    : $(grep_prop version "${TMPDIR}/module.prop")"
+sleep 0.1
+ui_print " Author     : $(grep_prop author "${TMPDIR}/module.prop")"
+sleep 0.2
 ui_print ""
-ui_print "╔══════════════════════════════════════╗"
-ui_print "║          LMK Engine 1.26 by P34            ║"
-ui_print "║     A module to boost smoothness           ║"
-ui_print "║          on low ram devices                ║"
-ui_print "╚══════════════════════════════════════╝"
+ui_print "======================================"
+ui_print "           DEVICE INFORMATION          "
+ui_print "======================================"
+ui_print " Model      : $(getprop ro.product.model)"
+sleep 0.1
+ui_print " Brand      : $(getprop ro.product.manufacturer)"
+sleep 0.1
+ui_print " Board      : $(getprop ro.product.board)"
+sleep 0.1
+ui_print " Android    : $(getprop ro.build.version.release)"
+sleep 0.1
+ui_print " Kernel     : $(uname -r)"
+sleep 0.1
+ui_print " CPU        : $(getprop ro.hardware)"
+sleep 0.1
+ui_print " RAM        : $(free | awk '/Mem:/ {print $2}') kB"
+sleep 0.2
 ui_print ""
-
-# ── Arch check ──────────────────────────────────────────────
-ui_print "- Checking architecture…"
-case "$ARCH" in
-  arm64)
-    ui_print "  ✓ arm64 detected!"
-    ;;
-  arm)
-    ui_print "  ✓ arm (32-bit) detected"
-    ;;
-  *)
-    ui_print "! Unsupported architecture: $ARCH"
-    abort "   LMK Engine requires arm/arm64."
-    ;;
-esac
-
-# ── Extract module files ─────────────────────────────────────
-# NOTE: SKIPUNZIP=1 means Magisk extracts NOTHING automatically —
-# every file the module needs at runtime, including uninstall.sh,
-# must be copied to $MODPATH explicitly right here. (uninstall.sh
-# was missing from this list for a long time, which silently meant
-# Magisk never ran it on module removal — the daemon and the swap
-# file were never being cleaned up.)
-ui_print "- Extracting module files…"
-unzip -o "$ZIPFILE" 'system/*'      -d "$MODPATH" >&2
-unzip -o "$ZIPFILE" 'service.sh'    -d "$MODPATH" >&2
-unzip -o "$ZIPFILE" 'module.prop'   -d "$MODPATH" >&2
-unzip -o "$ZIPFILE" 'uninstall.sh'  -d "$MODPATH" >&2
-
-# ── Verify binary ────────────────────────────────────────────
-BIN="$MODPATH/system/bin/lmk_engine"
-if [ ! -f "$BIN" ] || [ ! -s "$BIN" ]; then
-    ui_print ""
-    ui_print "! Binary not found or empty at system/bin/lmk_engine"
-    ui_print "  Compile it, then reflash the module."
-    ui_print ""
-    # Install anyway — service.sh will detect missing binary safely
+ui_print "======================================"
+ui_print "           ROOT ENVIRONMENT            "
+ui_print "======================================"
+if [ "$APATCH" ]; then
+    ROOT_METHOD="APatch"
+    ROOT_VERSION="$APATCH_VER ($APATCH_VER_CODE)"
+elif [ "$KSU" ]; then
+    if [ "$KSU_NEXT" ]; then
+        ROOT_METHOD="KernelSU Next"
+        ROOT_VERSION="$KSU_KERNEL_VER_CODE ($KSU_VER_CODE)"
+    else
+        ROOT_METHOD="KernelSU"
+        ROOT_VERSION="$KSU_KERNEL_VER_CODE ($KSU_VER_CODE)"
+    fi
+elif [ "$MAGISK_VER_CODE" ]; then
+    ROOT_METHOD="Magisk"
+    ROOT_VERSION="$MAGISK_VER ($MAGISK_VER_CODE)"
 else
-    ui_print "  ✓ Binary OK"
+    ROOT_METHOD="Unknown"
+    ROOT_VERSION="N/A"
 fi
-
-# ── Permissions ──────────────────────────────────────────────
-ui_print "- Setting permissions…"
-set_perm "$MODPATH/system/bin/lmk_engine" root root 0755 \
-    u:object_r:system_file:s0
-chmod +x "$MODPATH/service.sh"
-chmod +x "$MODPATH/uninstall.sh" 2>/dev/null
-
-# ── Disable stock lmkd? ──────────────────────────────────────
-#  On AOSP GSI, stock lmkd is managed by init. We don't stop it
-#  here because our daemon works alongside it; stopping lmkd
-#  requires vendored init changes that vary per device.
-ui_print "- Note: LMK Engine coexists with stock lmkd."
-ui_print "  It provides extra protection on top of the kernel LMK."
-
-# ── Done ─────────────────────────────────────────────────────
+ui_print " Method     : ${ROOT_METHOD}"
+ui_print " Version    : ${ROOT_VERSION}"
+sleep 0.3
 ui_print ""
-ui_print "✓ LMK Engine installed!"
-ui_print "  Reboot to activate."
-ui_print ""
-ui_print "  Log : /data/local/tmp/lmk_engine.log"
-ui_print "  PID : /data/local/tmp/lmk_engine.pid"
-ui_print ""
+ui_print "======================================"
+ui_print "             FINALIZATION              "
+ui_print "======================================"
+touch "$MODPATH/skip_mountify"
+if [ "$KSU" = "true" ] || [ "$APATCH" = "true" ]; then
+    ui_print " Configuring systemless mount"
+    touch "$MODPATH/skip_mount"
+    BIN_PATH="/data/adb/modules/lmk_engine/system/bin"
+    manager_paths="/data/adb/ap/bin /data/adb/ksu/bin"
+    for dir in $manager_paths; do
+        [ -d "$dir" ] && {
+            ln -sf "$BIN_PATH/lmk_engine" "$dir/lmk_engine"
+            ui_print "  + $dir/lmk_engine -> $BIN_PATH/lmk_engine"
+        }
+    done
+fi
+sleep 2
+ui_print " Installation successful"
+ui_print " Completed at : $(date '+%d %b %Y - %H:%M %Z')"
+ui_print " Dont forget to join my telegram channel"
+ui_print "======================================"
