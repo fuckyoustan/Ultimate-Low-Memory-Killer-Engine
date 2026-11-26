@@ -16,6 +16,7 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
 #include <sys/swap.h>
@@ -28,7 +29,7 @@
 /* ================================================================
  *  VERSION
  * ================================================================ */
-#define LMK_VERSION   "1.0"
+#define LMK_VERSION   "1.1"
 #define LMK_AUTHOR    "@fuckyoustan & P34"
 
 /* ================================================================
@@ -266,7 +267,13 @@
 /* ================================================================
  *  KILL HISTORY / COOLDOWN
  * ================================================================ */
-#define KILL_HIST_SIZE   32
+/* 256 slots (~68 KB RAM): a single T3(DEEP) sweep can kill up to 24
+ * processes at once, and logcat_kill_watch() + unattrib_check_vanished()
+ * add records on top of that. At 32 slots the ring buffer wrapped within
+ * seconds under that load, wiping the cooldown trail and starving
+ * check_bounced()/track_proc_bounce_window() of their history right in
+ * the middle of a burst. */
+#define KILL_HIST_SIZE   256
 
 /* ================================================================
  *  PROCESS PROTECTION LISTS (generic AOSP)
@@ -285,17 +292,13 @@ static const char * const NEVER_KILL[] = {
     NULL
 };
 
-static const char * const LAUNCHERS[] = {
-    "com.android.launcher","com.android.launcher2","com.android.launcher3",
-    "com.google.android.apps.nexuslauncher",
-    "com.miui.home","com.huawei.android.launcher",
-    "com.sec.android.app.launcher","com.teslacoilsw.launcher",
-    "com.microsoft.launcher",
-    NULL
-};
-
-/* Input method editors (keyboards) — must never be killed; losing the
- * active IME causes input field freezes / fallback-keyboard flicker. */
+/* Launcher and input-method protection is resolved from the active system
+ * defaults at runtime; hard-coded OEM package lists go stale across ROMs. */
+#define DYNAMIC_PROTECTED_PKG_MAX 256
+static char g_launcher_pkg[DYNAMIC_PROTECTED_PKG_MAX];
+static char g_ime_pkg[DYNAMIC_PROTECTED_PKG_MAX];
+static char g_media_pkg[DYNAMIC_PROTECTED_PKG_MAX];
+static time_t g_dynamic_protected_pkgs_t = 0;
 
 static const char * const SERVICE_EXEMPT[] = {
     "sandboxed_process",               /* webview/chrome sandboxed renderers */
@@ -311,29 +314,11 @@ static const char * const SERVICE_EXEMPT[] = {
     NULL
 };
 
-static const char * const IME_PKGS[] = {
-    "inputmethod.latin",               /* AOSP LatinIME / OpenBoard */
-    "com.google.android.inputmethod",  /* Gboard */
-    "com.touchtype.swiftkey",          /* SwiftKey */
-    "com.samsung.android.honeyboard",
-    "com.baidu.input",
-    "com.sohu.inputmethod",
-    "com.iflytek.inputmethod",
-    "com.komoxo.babelkeyboard",
-    NULL
-};
-
-static const char * const MEDIA_PLAYERS[] = {
-    "spotify","music","youtube","player","audio","podcast","radio",
-    "tidal","deezer","soundcloud","pandora","amazon","apple",
-    "vlc","audioplayer","media","song","fm",
-    NULL
-};
-
 /* ================================================================
  *  GLOBALS
  * ================================================================ */
-static volatile bool g_running      = true;
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_shutdown_signal = 0;
 static bool          g_zram_active  = false;
 static char          g_zram_dev[128] = {0};
 static char          g_zram_sys[128] = {0};
@@ -513,6 +498,11 @@ typedef struct {
 
     bool   cg_high_set;   /* true if memory.high is currently < max on this app */
     time_t cg_high_set_t; /* when set, for a future safety-net max-duration release */
+    bool   cg_high_effective; /* P1-7: last squeeze freed >= RECLAIM_MIN_FREED_KB.
+                               * In-memory only — not persisted. An ineffective
+                               * limit is released after
+                               * SQUEEZE_HIGH_FAILED_RELEASE_S instead of the
+                               * full 15-minute window. */
     bool   cg_low_set;    /* true if memory.low is currently > 0 on this app */
 
     time_t fg_hold_start;
@@ -574,6 +564,13 @@ typedef struct {
     time_t   bounce_first;      /* first kill in the window               */
     int      rank;
     time_t   last_genuine_fg;
+
+    /* P0-1: process identity captured at enumeration time from
+     * /proc/<pid>/stat field 22. kill_proc_verified() compares it
+     * against the live value right before SIGKILL so a recycled PID
+     * can never be killed from stale snapshot data. 0 = unreadable at
+     * enumeration (treated as unverifiable -> kill is skipped). */
+    unsigned long long starttime;
 
     bool     true_fg;
 } ProcInfo;
@@ -650,6 +647,19 @@ static int read_meminfo(MemInfo *m) {
     return 0;
 }
 
+/* P1-6: ONE shared definition of the CRITICAL RAM state — strictly
+ * below FREE_CRIT_PCT. RAM_LOW (below FREE_LOW_PCT) is a milder state
+ * and must never imply the aggressive no-spare/critical bypasses.
+ * Callers: adaptive_select_tier(), adaptive_kill_eligible(),
+ * adaptive_clean() (the should_spare_kill argument) and
+ * ram_pressure_and_adapt(). Boundary semantics (device threshold
+ * tests should cover exactly these values): avail_pct == FREE_CRIT_PCT
+ * is LOW, not CRITICAL; avail_pct == FREE_LOW_PCT is on the NORMAL
+ * side of LOW — every comparison is strictly-below. */
+static bool ram_state_critical(const MemInfo *mi) {
+    return mi->avail_pct < FREE_CRIT_PCT;
+}
+
 /* ================================================================
  *  PROCESS HELPERS
  * ================================================================ */
@@ -657,9 +667,137 @@ static bool name_matches(const char *name, const char * const *list) {
     for (int i = 0; list[i]; i++) if (strstr(name, list[i])) return true;
     return false;
 }
-static bool is_launcher_like(const char *n) { return name_matches(n, LAUNCHERS); }
-static bool is_ime_like(const char *n)      { return name_matches(n, IME_PKGS); }
-static bool is_media_player(const char *n)  { return name_matches(n, MEDIA_PLAYERS); }
+
+static void read_command_value(const char *cmd, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    out[0] = '\0';
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *candidate = strstr(line, "ComponentInfo{");
+        if (candidate) candidate += strlen("ComponentInfo{");
+        else candidate = line;
+        char *slash = strchr(candidate, '/');
+        if (!slash) continue;
+        char *start = candidate;
+        while (start < slash && isspace((unsigned char)*start)) start++;
+        size_t n = (size_t)(slash - start);
+        while (n && isspace((unsigned char)start[n - 1])) n--;
+        if (n == 0 || n >= outsz) continue;
+        memcpy(out, start, n);
+        out[n] = '\0';
+        break;
+    }
+    pclose(fp);
+}
+
+static bool audio_device_running(void) {
+    DIR *cards = opendir("/proc/asound");
+    if (!cards) return false;
+    bool running = false;
+    struct dirent *card;
+    while (!running && (card = readdir(cards)) != NULL) {
+        if (strncmp(card->d_name, "card", 4) != 0) continue;
+        /* P2-13: d_name can be up to 255 bytes — size every buffer in
+         * this chain for the worst case so -Wformat-truncation has
+         * nothing to report: card 12+255+1, pcm card+1+255+1,
+         * status pcm+1+255+7+1. */
+        char card_path[300];
+        snprintf(card_path, sizeof(card_path), "/proc/asound/%s", card->d_name);
+        DIR *card_dir = opendir(card_path);
+        if (!card_dir) continue;
+        struct dirent *pcm;
+        while (!running && (pcm = readdir(card_dir)) != NULL) {
+            if (strncmp(pcm->d_name, "pcm", 3) != 0) continue;
+            char pcm_path[600];
+            snprintf(pcm_path, sizeof(pcm_path), "%s/%s", card_path, pcm->d_name);
+            DIR *pcm_dir = opendir(pcm_path);
+            if (!pcm_dir) continue;
+            struct dirent *sub;
+            while (!running && (sub = readdir(pcm_dir)) != NULL) {
+                if (strncmp(sub->d_name, "sub", 3) != 0) continue;
+                char status_path[900], status[128];
+                snprintf(status_path, sizeof(status_path), "%s/%s/status", pcm_path, sub->d_name);
+                FILE *fp = fopen(status_path, "r");
+                if (!fp) continue;
+                if (fgets(status, sizeof(status), fp) && strstr(status, "RUNNING")) running = true;
+                fclose(fp);
+            }
+            closedir(pcm_dir);
+        }
+        closedir(card_dir);
+    }
+    closedir(cards);
+    return running;
+}
+
+static void refresh_dynamic_protected_pkgs(void) {
+    time_t now = time(NULL);
+    if (g_dynamic_protected_pkgs_t && now - g_dynamic_protected_pkgs_t < 60) return;
+    g_dynamic_protected_pkgs_t = now;
+    char old_launcher[DYNAMIC_PROTECTED_PKG_MAX];
+    char old_ime[DYNAMIC_PROTECTED_PKG_MAX];
+    snprintf(old_launcher, sizeof(old_launcher), "%s", g_launcher_pkg);
+    snprintf(old_ime, sizeof(old_ime), "%s", g_ime_pkg);
+    /* P2-13: value sized exactly like the destination buffers so the
+     * copies below can never truncate (read_command_value itself
+     * refuses candidates longer than outsz-1). */
+    char value[DYNAMIC_PROTECTED_PKG_MAX];
+    g_launcher_pkg[0] = '\0';
+    read_command_value("cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null", value, sizeof(value));
+    if (value[0] && !strstr(value, "No activity"))
+        snprintf(g_launcher_pkg, sizeof(g_launcher_pkg), "%s", value);
+    read_command_value("cmd settings get secure default_input_method 2>/dev/null", value, sizeof(value));
+    if (value[0] && strcmp(value, "null") != 0)
+        snprintf(g_ime_pkg, sizeof(g_ime_pkg), "%s", value);
+    else g_ime_pkg[0] = '\0';
+    if (strcmp(old_launcher, g_launcher_pkg) != 0 || strcmp(old_ime, g_ime_pkg) != 0) {
+        for (int i = 0; i < g_score_count; i++)
+            g_scores[i].static_class_cache = -1;
+    }
+    g_media_pkg[0] = '\0';
+    if (audio_device_running()) {
+        FILE *fp = popen("cmd media_session list-sessions 2>/dev/null", "r");
+        if (fp) {
+            char line[512];
+            char session_pkg[DYNAMIC_PROTECTED_PKG_MAX] = {0};
+            while (fgets(line, sizeof(line), fp)) {
+                char *pkg = strstr(line, "package=");
+                if (pkg) {
+                    pkg += 8;
+                    size_t n = strcspn(pkg, " \t\r\n,}");
+                    if (n > 0 && n < sizeof(session_pkg)) {
+                        memcpy(session_pkg, pkg, n);
+                        session_pkg[n] = '\0';
+                    }
+                }
+                bool playing = strstr(line, "state=3") != NULL ||
+                               strstr(line, "state=PlaybackState {state=3") != NULL;
+                if (playing && session_pkg[0])
+                    snprintf(g_media_pkg, sizeof(g_media_pkg), "%s", session_pkg);
+            }
+            pclose(fp);
+        }
+    }
+}
+
+static bool package_process_matches(const char *name, const char *component) {
+    if (!name || !component || !component[0]) return false;
+    const char *slash = strchr(component, '/');
+    size_t len = slash ? (size_t)(slash - component) : strlen(component);
+    return len > 0 && strncmp(name, component, len) == 0 &&
+           (name[len] == '\0' || name[len] == ':');
+}
+static bool is_launcher_like(const char *n) {
+    return package_process_matches(n, g_launcher_pkg);
+}
+static bool is_ime_like(const char *n) {
+    return package_process_matches(n, g_ime_pkg);
+}
+static bool is_media_player(const char *n) {
+    return package_process_matches(n, g_media_pkg);
+}
 
 /* Forward declaration — full definition is in SCORE CATEGORY section below */
 static int classify_score_cat(const char *name);
@@ -850,10 +988,58 @@ static long zram_sysfs_rd(const char *sys, const char *attr) {
     FILE *f = fopen(path,"r"); if (!f) return -1;
     long v = -1; fscanf(f,"%ld",&v); fclose(f); return v;
 }
-static void zram_sysfs_wr(const char *sys, const char *attr, const char *val) {
+
+/* P0-4: sysfs writes now report success/failure so no configuration
+ * flow can continue as if a failed write had been applied. open()
+ * failure, short writes and close() errors all surface to the caller;
+ * the log carries path + errno (or "short write") for diagnosis. */
+static bool zram_sysfs_wr(const char *sys, const char *attr, const char *val) {
+    if (!sys || !attr || !val) return false;
     char path[256]; snprintf(path, sizeof(path), "%s/%s", sys, attr);
-    FILE *f = fopen(path,"w"); if (!f) { loge("sysfs write failed: %s", path); return; }
-    fputs(val, f); fclose(f);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        loge("sysfs write open failed: %s: %s", path, strerror(errno));
+        return false;
+    }
+    size_t len = strlen(val);
+    ssize_t w = write(fd, val, len);
+    int saved = errno;
+    int rc = close(fd);
+    if (w != (ssize_t)len) {
+        loge("sysfs write failed: %s (wrote %zd of %zu bytes): %s",
+             path, w < 0 ? (ssize_t)0 : w, len,
+             w < 0 ? strerror(saved) : "short write");
+        return false;
+    }
+    if (rc != 0) {
+        loge("sysfs write close failed: %s: %s", path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+/* P0-4: configure compression before disksize after every reset (a
+ * reset may restore kernel defaults for both the algorithm and
+ * stream count). Streams/algorithm are best-effort — some kernels
+ * don't expose max_comp_streams and may not carry lz4 — but disksize
+ * is mandatory: its failure aborts the bring-up. */
+static bool zram_configure(long target_bytes) {
+    int cpus = (int)sysconf(_SC_NPROCESSORS_CONF);
+    if (cpus < 1) cpus = 4;
+    char streams[16];
+    snprintf(streams, sizeof(streams), "%d\n", cpus);
+    if (!zram_sysfs_wr(g_zram_sys, "max_comp_streams", streams))
+        logw("ZRAM: max_comp_streams write failed (non-fatal on some kernels)");
+    if (!zram_sysfs_wr(g_zram_sys, "comp_algorithm", "lz4\n"))
+        logw("ZRAM: comp_algorithm=lz4 rejected — keeping kernel default");
+    usleep(50000);
+    char disksize[32];
+    snprintf(disksize, sizeof(disksize), "%ld\n", target_bytes);
+    if (!zram_sysfs_wr(g_zram_sys, "disksize", disksize)) {
+        loge("ZRAM: disksize write failed — bring-up aborted");
+        return false;
+    }
+    return true;
 }
 
 static long zram_orig_data_kb(long *compr_kb_out) {
@@ -892,36 +1078,85 @@ static bool zram_find(char *dev, size_t dsz, char *sys, size_t ssz) {
     return false;
 }
 
+/* P0-2: parse /proc/swaps and return the ZRAM device's own line.
+ * *used_kb_out receives the Used column in kB (-1 when absent);
+ * the return value is true only when the device has a well-formed
+ * active line. The header line, incomplete lines and malformed
+ * columns are tolerated (skipped), and the device is matched by its
+ * exact filename so a coexisting file swap (/data/lmk_swap) can
+ * never contaminate the numbers. */
+static bool zram_lookup_proc_swaps(long *used_kb_out) {
+    if (used_kb_out) *used_kb_out = -1;
+    if (!g_zram_dev[0]) return false;
+    FILE *f = fopen("/proc/swaps", "r");
+    if (!f) return false;
+    bool found = false;
+    char line[512];
+    bool header = true;
+    while (fgets(line, sizeof(line), f)) {
+        if (header) { header = false; continue; }   /* skip header line */
+        char fn[300], type[32];
+        long size_kb = -1, used_kb = -1; int prio = -1;
+        int n = sscanf(line, "%299s %31s %ld %ld %d",
+                       fn, type, &size_kb, &used_kb, &prio);
+        (void)type; (void)size_kb; (void)prio;      /* column anchors only */
+        if (n < 4) continue;                        /* incomplete line */
+        if (strcmp(fn, g_zram_dev) != 0) continue;  /* other swap device */
+        if (used_kb < 0) continue;                  /* malformed Used col */
+        if (used_kb_out) *used_kb_out = used_kb;
+        found = true;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
+/* P0-2/P0-3: runtime ZRAM state is derived from /proc/swaps, never
+ * assumed — g_zram_active must always mirror this after any cycle,
+ * resize or recovery attempt. */
+static bool zram_is_active_in_proc_swaps(void) {
+    return zram_lookup_proc_swaps(NULL);
+}
+
 static void zram_read_stats(ZramInfo *z) {
     memset(z, 0, sizeof(*z));
     if (!g_zram_dev[0]) return;
     snprintf(z->dev, sizeof(z->dev), "%s", g_zram_dev);
     snprintf(z->sys, sizeof(z->sys), "%s", g_zram_sys);
-    FILE *f = fopen("/proc/swaps","r");
-    if (f) {
-        char line[256]; fgets(line, sizeof(line), f);
-        while (fgets(line, sizeof(line), f))
-            if (strstr(line, g_zram_dev)) { z->active = true; break; }
-        fclose(f);
-    }
+
+    /* P0-2: ZRAM usage comes ONLY from this device's own line in
+     * /proc/swaps. The old SwapTotal-SwapFree arithmetic summed every
+     * swap backend on the system, so a busy /data swapfile inflated
+     * z->used_pct and drove ZRAM-tier kills the ZRAM device itself
+     * never justified. When the line is missing or malformed the
+     * device is reported inactive with zeroed usage — never a
+     * fabricated number. */
+    long used_kb = -1;
+    z->active = zram_lookup_proc_swaps(&used_kb);
+    z->used_kb = (z->active && used_kb >= 0) ? used_kb : 0;
+
     long ds = zram_sysfs_rd(g_zram_sys, "disksize");
     z->disksize_kb = (ds > 0) ? ds / 1024 : 0;
-    MemInfo mi; read_meminfo(&mi);
-    z->used_kb = mi.swap_total_kb - mi.swap_free_kb;
-    if (z->used_kb < 0) z->used_kb = 0;
+
     long orig = zram_orig_data_kb(&z->compr_data_kb);
-    z->orig_data_kb = (orig > 0) ? orig : (z->used_kb * 4 / 10);
+    if (orig > 0) {
+        z->orig_data_kb = orig;
+    } else if (z->used_kb > 0) {
+        /* mm_stat unavailable on this kernel: keep the legacy 40%
+         * estimate, but anchored to the device's real usage — not the
+         * system-wide swap delta. */
+        z->orig_data_kb = z->used_kb * 4 / 10;
+    }
     /* compr_data_kb fallback: if mm_stat's second field wasn't readable
      * (older kernel format, parse failure), leave it at 0 rather than
      * guessing — callers must check >0 before trusting it, same pattern
      * as orig_data_kb's fallback but without inventing a fake ratio. */
     if (z->compr_data_kb < 0) z->compr_data_kb = 0;
-    if (z->disksize_kb > 0)
+
+    if (z->disksize_kb > 0 && z->active)
         z->used_pct = (int)((z->used_kb * 100) / z->disksize_kb);
-    else if (mi.swap_total_kb > 0)
-        z->used_pct = (int)((z->used_kb * 100) / mi.swap_total_kb);
     else
-        z->used_pct = 0;
+        z->used_pct = 0;   /* no disksize = unknown, not zero-usage */
 }
 
 static pid_t g_kswapd_pid          = -1;
@@ -962,6 +1197,114 @@ static unsigned long long read_proc_starttime(pid_t pid) {
         &starttime);
     if (n != 1) return 0;
     return starttime;
+}
+
+/* ================================================================
+ *  P0-1: PID IDENTITY VALIDATION BEFORE KILL
+ *  Every SIGKILL goes through kill_proc_verified(). The snapshot's
+ *  starttime is compared against the live /proc/<pid>/stat value; a
+ *  mismatch means the PID was recycled (or the process exited)
+ *  between enumerate_procs() and the kill decision — the entry is
+ *  stale and MUST NOT be signalled. When the kernel supports pidfd
+ *  (5.3+; universal syscall numbers 434/424), the signal goes through
+ *  pidfd_send_signal(), which pins the exact struct pid at open time
+ *  and closes even the microscopic check-then-kill race that plain
+ *  kill() would still have. A vanished target is logged and skipped —
+ *  never treated as a fatal failure.
+ * ================================================================ */
+#ifndef __NR_pidfd_open
+#define __NR_pidfd_open 434
+#endif
+#ifndef __NR_pidfd_send_signal
+#define __NR_pidfd_send_signal 424
+#endif
+
+/* True only when the PID still points at the exact process captured
+ * by enumerate_procs(). */
+static bool proc_identity_still_valid(const ProcInfo *p) {
+    if (!p || p->pid <= 0) return false;
+    if (p->starttime == 0) return false;  /* unverifiable snapshot — refuse */
+    unsigned long long cur = read_proc_starttime(p->pid);
+    return cur != 0 && cur == p->starttime;
+}
+
+/* Verified SIGKILL.
+ *
+ * Ordering matters (TODO P0): the pidfd MUST be opened BEFORE the
+ * starttime is compared. pidfd_open() pins the struct pid that the PID
+ * number resolves to at that instant. Validating first and opening
+ * second leaves a window in which the PID can be recycled, and the
+ * pidfd would then be bound to the *replacement* process. With the
+ * order below, any recycling that happens before pidfd_open() is caught
+ * by the starttime comparison (the pidfd refers to the new process,
+ * whose starttime differs), and any recycling after pidfd_open() is
+ * impossible because the pidfd keeps referring to the original process
+ * (a dead process yields ESRCH from pidfd_send_signal, never a signal
+ * to a stranger).
+ *
+ * Fallback policy:
+ *   - pidfd syscalls absent (ENOSYS)        -> kill() after an immediate
+ *                                               starttime re-check.
+ *   - EMFILE / ENFILE / ENOMEM / other      -> ABORT, no kill. Resource
+ *                                               pressure must not push us
+ *                                               onto the weaker path.
+ *   - ESRCH                                 -> process already gone: skip.
+ *
+ * Residual risk (documented, cannot be removed): the kill() fallback
+ * keeps a check-then-kill race window between the /proc read and the
+ * kill() syscall. It only runs on kernels without pidfd (<5.3 / blocked
+ * by seccomp), where nothing better exists.
+ *
+ * Returns  0  signal delivered,
+ *          1  target skipped (identity changed / process gone / aborted
+ *             for resource reasons — errno is preserved),
+ *         -1  signal failed (errno set; e.g. EPERM). */
+static int kill_proc_verified(const ProcInfo *p) {
+    if (!p || p->pid <= 0 || p->starttime == 0) {
+        if (p) logi("KillSkip: pid=%d [%s] unverifiable snapshot entry",
+                    p->pid, p->name);
+        return p ? 1 : -1;
+    }
+
+    int fd = (int)syscall(__NR_pidfd_open, p->pid, 0);
+    if (fd >= 0) {
+        /* pidfd pinned — now verify what it is pinned to. */
+        if (!proc_identity_still_valid(p)) {
+            close(fd);
+            logi("KillSkip: pid=%d [%s] identity changed or process gone "
+                 "(stale snapshot entry)", p->pid, p->name);
+            return 1;
+        }
+        int rc = (int)syscall(__NR_pidfd_send_signal, fd, SIGKILL, NULL, 0);
+        int saved = errno;
+        close(fd);
+        if (rc == 0) return 0;
+        if (saved == ESRCH) return 1;          /* exited meanwhile */
+        if (saved != ENOSYS) { errno = saved; return -1; }
+        /* ENOSYS from pidfd_send_signal only: fall through to the
+         * guarded kill() below. */
+    } else {
+        int oerr = errno;
+        if (oerr == ESRCH) return 1;           /* already gone */
+        if (oerr != ENOSYS) {
+            /* EMFILE / ENFILE / ENOMEM / EPERM (seccomp) / EINVAL...:
+             * do NOT degrade to the racy path. Abort this kill. */
+            logw("KillAbort: pid=%d [%s] pidfd_open failed (%s) — "
+                 "refusing weaker kill() fallback",
+                 p->pid, p->name, strerror(oerr));
+            errno = oerr;
+            return 1;
+        }
+        /* ENOSYS: kernel has no pidfd_open — genuine "unsupported". */
+    }
+
+    /* Fallback: validate as late as possible, then kill(). */
+    if (!proc_identity_still_valid(p)) {
+        logi("KillSkip: pid=%d [%s] identity changed or process gone "
+             "(fallback path)", p->pid, p->name);
+        return 1;
+    }
+    return kill(p->pid, SIGKILL);
 }
 
 static pid_t find_kswapd_pid(void) {
@@ -1130,6 +1473,78 @@ static void cpu_track_sample(double *self_pct_out, double *kswapd_pct_out) {
     g_last_cpu_smpl_t = now;
 }
 
+/* P0-3/P0-4: shared bring-up sequence used by initial setup, cycle
+ * and deferred resize: reset → configure → mkswap → swapon, every
+ * stage checked, ending with a /proc/swaps verification. Never
+ * blindly resets a device that is already verifiably swapped on —
+ * that covers the "unclear status" case between recovery retries
+ * (a half-succeeded attempt must not be reset again while live). */
+static bool zram_bring_up(long target_bytes, const char *who) {
+    if (zram_is_active_in_proc_swaps()) {
+        logi("%s: device already swapped on — skipping reset", who);
+        return true;
+    }
+    if (!zram_sysfs_wr(g_zram_sys, "reset", "1\n")) {
+        loge("%s: reset stage failed", who);
+        return false;
+    }
+    usleep(100000);
+    if (!zram_configure(target_bytes)) {
+        loge("%s: configure stage failed after reset", who);
+        return false;
+    }
+    usleep(100000);
+    char cmd[200];
+    snprintf(cmd, sizeof(cmd), "mkswap %s >/dev/null 2>&1", g_zram_dev);
+    if (system(cmd) != 0) {
+        loge("%s: mkswap stage failed", who);
+        return false;
+    }
+    if (swapon(g_zram_dev, 0) < 0) {
+        loge("%s: swapon stage failed: %s", who, strerror(errno));
+        return false;
+    }
+    if (!zram_is_active_in_proc_swaps()) {
+        loge("%s: swapon returned success but device missing from /proc/swaps",
+             who);
+        return false;
+    }
+    return true;
+}
+
+#define ZRAM_CYCLE_RECOVER_ATTEMPTS 3
+
+/* P0-3: bounded recovery after a failed bring-up — re-attempt the
+ * full sequence with backoff instead of leaving the device unswapped
+ * (or worse, marking it active while it is not). */
+static bool zram_bring_up_recover(long target_bytes, const char *who) {
+    for (int r = 1; r <= ZRAM_CYCLE_RECOVER_ATTEMPTS; r++) {
+        logw("%s: recovery attempt %d/%d", who, r, ZRAM_CYCLE_RECOVER_ATTEMPTS);
+        usleep(1000000);
+        if (zram_bring_up(target_bytes, who)) return true;
+    }
+    return false;
+}
+
+/* TODO v1.1 P1: the ONE bring-up policy shared by initial setup,
+ * resize-after-swapoff, cycle and deferred resize: one bring-up
+ * attempt, then bounded recovery (ZRAM_CYCLE_RECOVER_ATTEMPTS, 1 s
+ * backoff each — no unbounded retry), then g_zram_active is re-derived
+ * from /proc/swaps whatever happened. Returns the verified runtime
+ * state, so callers never trust a stale flag or a return value alone. */
+static bool zram_bring_up_synced(long target_bytes, const char *who) {
+    bool ok = zram_bring_up(target_bytes, who);
+    if (!ok) ok = zram_bring_up_recover(target_bytes, who);
+    g_zram_active = zram_is_active_in_proc_swaps();
+    if (!g_zram_active)
+        loge("%s: bring-up + recovery failed — ZRAM inactive "
+             "(g_zram_active=false, verified via /proc/swaps)", who);
+    else if (!ok)
+        logw("%s: bring-up reported failure but device is in /proc/swaps — "
+             "state synced to active", who);
+    return g_zram_active;
+}
+
 static void zram_setup(void) {
     if (!g_zram_dev[0] || !g_zram_sys[0]) return;
     if (g_total_ram_kb <= 0) {
@@ -1144,14 +1559,7 @@ static void zram_setup(void) {
     logi("ZRAM: target %ldMB (%d%% of %ldMB RAM)",
          target_bytes/1024/1024, ZRAM_SIZE_PCT, g_total_ram_kb/1024);
 
-    bool already_active = false;
-    FILE *f = fopen("/proc/swaps","r");
-    if (f) {
-        char line[256]; fgets(line, sizeof(line), f);
-        while (fgets(line, sizeof(line), f))
-            if (strstr(line, g_zram_dev)) { already_active = true; break; }
-        fclose(f);
-    }
+    bool already_active = zram_is_active_in_proc_swaps();
 
     long current_bytes = 0;
     long ds = zram_sysfs_rd(g_zram_sys, "disksize");
@@ -1189,49 +1597,30 @@ static void zram_setup(void) {
             loge("ZRAM: swapoff failed after 3 attempts: %s — adopting as-is; "
                  "will retry resize once ZRAM drops to <=50%% used",
                  strerror(errno));
-            g_zram_active       = true;
-            g_zram_needs_resize = true;
+            g_zram_active       = zram_is_active_in_proc_swaps();
+            g_zram_needs_resize = g_zram_active;
             return;
         }
+        /* Device is verifiably off from here until bring-up says
+         * otherwise. */
+        g_zram_active = false;
         usleep(150000);
         already_active = false;
     }
 
     if (!already_active) {
-        bool setup_ok = false;
-        for (int attempt = 0; attempt < 3 && !setup_ok; attempt++) {
-            if (attempt > 0) {
-                logw("ZRAM: setup retry %d/2 …", attempt);
-                usleep(1000000);
-            }
-            zram_sysfs_wr(g_zram_sys, "reset", "1\n");
-            usleep(100000);
-            int cpus = sysconf(_SC_NPROCESSORS_CONF);
-            if (cpus < 1) cpus = 4;
-            char buf[16]; snprintf(buf, sizeof(buf), "%d\n", cpus);
-            zram_sysfs_wr(g_zram_sys, "max_comp_streams", buf);
-            zram_sysfs_wr(g_zram_sys, "comp_algorithm", "lz4\n");
-            usleep(50000);
-            char sval[32]; snprintf(sval, sizeof(sval), "%ld\n", target_bytes);
-            zram_sysfs_wr(g_zram_sys, "disksize", sval);
-            usleep(100000);
-            char cmd[200];
-            snprintf(cmd, sizeof(cmd), "mkswap %s >/dev/null 2>&1", g_zram_dev);
-            if (system(cmd) != 0) {
-                loge("ZRAM: mkswap failed (attempt %d)", attempt + 1); continue;
-            }
-            if (swapon(g_zram_dev, 0) < 0) {
-                loge("ZRAM: swapon failed (attempt %d): %s", attempt + 1, strerror(errno));
-                continue;
-            }
-            setup_ok = true;
-        }
-        if (!setup_ok) { loge("ZRAM: all attempts failed"); return; }
-        g_zram_active = true;
+        /* Same retry/recovery policy as cycle and deferred resize;
+         * g_zram_active is synced from /proc/swaps inside. */
+        if (!zram_bring_up_synced(target_bytes, "ZRAM")) return;
         logi("ZRAM: active on %s (%ldMB)", g_zram_dev, target_bytes/1024/1024);
     }
 }
 
+/* P0-3: full cycle with per-stage validation and a bounded recovery
+ * path. Stages: swapoff → (bring_up: reset → configure → mkswap →
+ * swapon → verify). g_zram_active is set false the moment swapoff
+ * succeeds and is re-derived from /proc/swaps after every stage —
+ * never assumed from a function's return value alone. */
 static void zram_cycle(bool bypass_gate) {
     if (!g_zram_dev[0] || !g_zram_active) return;
     MemInfo mi; read_meminfo(&mi);
@@ -1268,19 +1657,28 @@ static void zram_cycle(bool bypass_gate) {
         logi("ZRAMcycle: swapoff succeeded on attempt %d/%d",
              zc_attempt, ZRAM_CYCLE_RETRIES);
     }
+
+    /* From here the device is swapped OFF — runtime status must say
+     * so until a verified bring-up says otherwise. */
+    g_zram_active = false;
     usleep(100000);
-    zram_sysfs_wr(g_zram_sys, "reset", "1\n");
-    usleep(50000);
+
     long target_bytes = (long)g_total_ram_kb * 1024LL * ZRAM_SIZE_PCT / 100;
-    char sval[32]; snprintf(sval, sizeof(sval), "%ld\n", target_bytes);
-    zram_sysfs_wr(g_zram_sys, "disksize", sval);
-    char cmd[200]; snprintf(cmd, sizeof(cmd), "mkswap %s >/dev/null 2>&1", g_zram_dev);
-    if (system(cmd) != 0) { loge("ZRAMcycle: mkswap failed"); return; }
-    if (swapon(g_zram_dev, 0) < 0) { loge("ZRAMcycle: swapon failed"); return; }
-    logi("ZRAMcycle: done, ZRAM fresh (%ldMB)", target_bytes/1024/1024);
-    g_zram_pct_at_start = 0;
-    g_zram_kill_start_t = 0;
-    g_zram_pause_until  = 0;
+
+    /* Unified bring-up + bounded recovery. The device was verifiably
+     * off when the cycle started, so a fresh reset inside each attempt
+     * is safe (zram_bring_up skips the reset if the device turns out
+     * to be swapped on already). g_zram_active is synced from
+     * /proc/swaps inside the helper. */
+    if (zram_bring_up_synced(target_bytes, "ZRAMcycle")) {
+        logi("ZRAMcycle: done, ZRAM fresh (%ldMB)", target_bytes/1024/1024);
+        g_zram_pct_at_start = 0;
+        g_zram_kill_start_t = 0;
+        g_zram_pause_until  = 0;
+        return;
+    }
+    loge("ZRAMcycle: ZRAM features stay disabled until the next successful "
+         "setup (daemon restart or manual --force-zram-cycle)");
 }
 
 #define ZRAM_RESIZE_STUCK_WARN_S 1800  /* 30min */
@@ -1324,27 +1722,20 @@ static void zram_try_deferred_resize(MemInfo *mi) {
         return;
     }
     usleep(150000);
-    zram_sysfs_wr(g_zram_sys, "reset", "1\n");
-    usleep(100000);
-    char sval[32]; snprintf(sval, sizeof(sval), "%ld\n", target_bytes);
-    zram_sysfs_wr(g_zram_sys, "disksize", sval);
-    usleep(100000);
-    char cmd[200];
-    snprintf(cmd, sizeof(cmd), "mkswap %s >/dev/null 2>&1", g_zram_dev);
-    if (system(cmd) != 0) {
-        loge("ZRAMresize: mkswap failed — ZRAM disabled");
-        g_zram_active = false; g_zram_needs_resize = false; return;
+
+    /* P0-3: same staged bring-up + bounded recovery as the cycle path;
+    g_zram_active tracks the kernel truth at every exit. */
+    g_zram_active = false;
+    bool up = zram_bring_up_synced(target_bytes, "ZRAMresize");
+    g_zram_needs_resize = false;  /* meaningless while inactive — next boot's
+                                   * zram_setup() owns the fresh setup */
+    if (up) {
+        g_zram_pct_at_start = 0;
+        g_zram_kill_start_t = 0;
+        g_zram_pause_until  = 0;
+        logi("ZRAMresize: complete — ZRAM now %ldMB (%d%% of RAM)",
+             target_bytes/1024/1024, ZRAM_SIZE_PCT);
     }
-    if (swapon(g_zram_dev, 0) < 0) {
-        loge("ZRAMresize: swapon failed: %s — ZRAM disabled", strerror(errno));
-        g_zram_active = false; g_zram_needs_resize = false; return;
-    }
-    g_zram_needs_resize = false;
-    g_zram_pct_at_start = 0;
-    g_zram_kill_start_t = 0;
-    g_zram_pause_until  = 0;
-    logi("ZRAMresize: complete — ZRAM now %ldMB (%d%% of RAM)",
-         target_bytes/1024/1024, ZRAM_SIZE_PCT);
 }
 
 /* ================================================================
@@ -1458,6 +1849,79 @@ static void update_swappiness(int zram_pct) {
  * ================================================================ */
 
 #define SCREEN_POLL_INTVL_S 5
+
+/* sysfs backlight state — resolved once, then read with plain
+ * open()/read(). Zero fork(): the old popen("cmd power ...") here meant
+ * 12 fork()+sh -c per minute even while the phone slept. */
+static char g_backlight_path[192] = {0};
+static bool g_backlight_resolved  = false;
+
+/* Returns true and stores the brightness value when a readable sysfs
+ * brightness file exists; false when this device exposes none (caller
+ * falls back to `cmd power`). A file that vanishes after being resolved
+ * invalidates the cache so the next poll re-scans. */
+static bool backlight_read(long *out_val) {
+    if (!g_backlight_resolved) {
+        g_backlight_resolved = true;
+        g_backlight_path[0] = '\0';
+        if (access("/sys/class/leds/lcd-backlight/brightness", R_OK) == 0) {
+            snprintf(g_backlight_path, sizeof(g_backlight_path),
+                     "/sys/class/leds/lcd-backlight/brightness");
+        } else {
+            DIR *d = opendir("/sys/class/backlight");
+            if (d) {
+                struct dirent *de;
+                while ((de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    /* %.64s bounds the dirent name so the composed path
+                     * provably fits g_backlight_path. */
+                    snprintf(g_backlight_path, sizeof(g_backlight_path),
+                             "/sys/class/backlight/%.64s/brightness",
+                             de->d_name);
+                    if (access(g_backlight_path, R_OK) == 0)
+                        break;
+                    g_backlight_path[0] = '\0';
+                }
+                closedir(d);
+            }
+        }
+    }
+    if (!g_backlight_path[0]) return false;
+
+    int fd = open(g_backlight_path, O_RDONLY);
+    if (fd < 0) { g_backlight_resolved = false; return false; }
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) { g_backlight_resolved = false; return false; }
+    buf[n] = '\0';
+    *out_val = atol(buf);
+    return true;
+}
+
+/* Secondary check for panels that keep their last brightness value in
+ * sysfs while blanked: bl_power == 4 (FB_BLANK_POWERDOWN) means the
+ * panel is off regardless of the brightness number. Only the
+ * /sys/class/backlight directory exposes bl_power — returns false when
+ * there is nothing to read (leds path, unsupported driver). */
+static bool backlight_blanked(void) {
+    if (!g_backlight_path[0]) return false;
+    if (!strstr(g_backlight_path, "/sys/class/backlight/")) return false;
+    char ppath[192];
+    snprintf(ppath, sizeof(ppath), "%s", g_backlight_path);
+    char *slash = strrchr(ppath, '/');
+    if (!slash) return false;
+    snprintf(slash + 1, sizeof(ppath) - (size_t)(slash + 1 - ppath), "bl_power");
+    int fd = open(ppath, O_RDONLY);
+    if (fd < 0) return false;
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    return atoi(buf) == 4;   /* FB_BLANK_POWERDOWN */
+}
+
 static bool is_screen_off(void) {
     static time_t last_check = 0;
     static bool   cached = false;
@@ -1465,7 +1929,15 @@ static bool is_screen_off(void) {
     if (now - last_check < SCREEN_POLL_INTVL_S) return cached;
     last_check = now;
 
-    /* Prioritas: cmd power get-wakefulness (Android 11+, 1 baris output).
+    /* Fast path: sysfs backlight brightness == 0 -> panel off. No fork. */
+    long bl = -1;
+    if (backlight_read(&bl)) {
+        cached = (bl <= 0) || backlight_blanked();
+        return cached;
+    }
+
+    /* Fallback (device tanpa sysfs backlight yang bisa dibaca):
+     * Prioritas: cmd power get-wakefulness (Android 11+, 1 baris output).
      * Fallback ke dumpsys power | grep untuk Android lama — tetap jauh
      * lebih ringan dari dumpsys penuh. */
     FILE *p = popen("cmd power get-wakefulness 2>/dev/null || "
@@ -1483,11 +1955,21 @@ static bool is_screen_off(void) {
     return cached;
 }
 
+#define DOZE_POLL_INTVL_S 30   /* deep-doze transitions are minute-scale;
+                                  * polling every 5s was pure fork() churn */
 static bool is_doze_active(void) {
     static time_t last_check = 0;
     static bool   cached = false;
     time_t now = time(NULL);
-    if (now - last_check < SCREEN_POLL_INTVL_S) return cached;
+    if (now - last_check < DOZE_POLL_INTVL_S) return cached;
+    /* Deep doze hanya bisa aktif saat layar mati, dan is_screen_off()
+     * sekarang bebas fork() — jadi skip popen cmd deviceidle seluruhnya
+     * selama layar menyala. */
+    if (!is_screen_off()) {
+        last_check = now;
+        cached = false;
+        return cached;
+    }
     last_check = now;
     /* cmd deviceidle: sub-perintah resmi, output 1 baris (IDLE/ACTIVE) */
     FILE *p = popen("cmd deviceidle get deep 2>/dev/null", "r");
@@ -1588,6 +2070,7 @@ static void parse_widget_xml(FILE *f) {
 }
 
 static void load_active_widget_pkgs(void) {
+    refresh_dynamic_protected_pkgs();
     time_t now = time(NULL);
     int intvl = (g_wpkg_count > 0) ? WIDGET_RELOAD_S : WIDGET_RETRY_S;
     if (g_wpkg_ts > 0 && now - g_wpkg_ts < intvl) return;
@@ -1676,9 +2159,24 @@ static void load_active_widget_pkgs(void) {
         return;
     }
 
+    /* Compare as a set: XML/source ordering is not meaningful. Invalidate
+     * cached static classifications only when provider membership changes. */
+    bool changed = (tmp_count != g_wpkg_count);
+    for (int i = 0; i < tmp_count && !changed; i++) {
+        bool found = false;
+        for (int j = 0; j < g_wpkg_count; j++)
+            if (strcmp(tmp_pkgs[i], g_wpkg[j]) == 0) { found = true; break; }
+        if (!found) changed = true;
+    }
+
     /* Commit: only update the live list once we have a result */
     g_wpkg_count = tmp_count;
     memcpy(g_wpkg, tmp_pkgs, sizeof(char) * tmp_count * 128);
+    if (changed) {
+        for (int i = 0; i < g_score_count; i++)
+            g_scores[i].static_class_cache = -1;
+        logi("Widget: provider list changed; refreshed static class cache");
+    }
     if (g_wpkg_count > 0)
         logi("Widget: %d active provider(s) loaded", g_wpkg_count);
 }
@@ -1806,35 +2304,40 @@ static void check_bounced(const char *name) {
 }
 
 /* ================================================================
- *  SYSTEM PACKAGE CACHE
- *  Sumber kebenaran: PackageManager (via `cmd package list packages -s`).
+ *  SYSTEM/USER PACKAGE CACHE
+ *  Sumber kebenaran: PackageManager (via `cmd package list packages`).
+ *  KEDUA daftar di-cache sekaligus — system apps (-s) dan user apps (-3).
+ *  Dengan keduanya di memori, classify_dumpsys_drain() dapat mengonfirmasi
+ *  hampir semua package tanpa perlu `cmd package path` satuan (yang
+ *  berarti fork()+sh -c per nama, berkali-kali saat dot-walking).
  *  Jauh lebih akurat daripada prefix hardcoded (com.android.*, dll) di
  *  ROM OEM mana pun — nama package OEM (mis. com.miui.*, com.samsung.*)
  *  otomatis terdeteksi tanpa perlu didaftarkan manual.
  * ================================================================ */
 #define SYSPKG_CACHE_S 300
-static char  **g_syspkg_list  = NULL;
-static int     g_syspkg_count = 0;
-static time_t  g_syspkg_ts    = 0;
+static char **g_syspkg_list  = NULL;
+static int    g_syspkg_count = 0;
+static char **g_userpkg_list = NULL;
+static int    g_userpkg_count = 0;
+static time_t g_syspkg_ts    = 0;
 
-static void syspkg_cache_free(void) {
-    for (int i = 0; i < g_syspkg_count; i++) free(g_syspkg_list[i]);
-    free(g_syspkg_list);
-    g_syspkg_list = NULL;
-    g_syspkg_count = 0;
+static void pkg_list_free(char **list, int count) {
+    if (!list) return;
+    for (int i = 0; i < count; i++) free(list[i]);
+    free(list);
 }
 
-static void load_syspkg_cache(void) {
-    time_t now = time(NULL);
-    if (g_syspkg_ts > 0 && (now - g_syspkg_ts) < SYSPKG_CACHE_S) return;
-    g_syspkg_ts = now;   /* set sebelum popen agar tidak hammer saat gagal */
-
-    FILE *p = popen("cmd package list packages -s 2>/dev/null", "r");
-    if (!p) return;
+/* Run one `cmd package list packages <flag>` and return a malloc'd list
+ * of package names (*out_list stays NULL and 0 is returned on failure,
+ * so any previously cached list can be kept untouched). */
+static int pkg_list_load(const char *cmd, char ***out_list) {
+    *out_list = NULL;
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
 
     int cap = 256, n = 0;
-    char **list = calloc(cap, sizeof(char *));
-    if (!list) { pclose(p); return; }
+    char **list = calloc((size_t)cap, sizeof(char *));
+    if (!list) { pclose(p); return 0; }
 
     char line[256];
     while (fgets(line, sizeof(line), p)) {
@@ -1844,8 +2347,11 @@ static void load_syspkg_cache(void) {
             len--;
         if (len <= 0) continue;
         if (n >= cap) {
+            /* Audit (-Wsign-conversion): cap is always > 0 here; the
+             * explicit ceiling keeps cap*2 far from int overflow. */
+            if (cap >= (1 << 20)) break;
             cap *= 2;
-            char **nl = realloc(list, cap * sizeof(char *));
+            char **nl = realloc(list, (size_t)cap * sizeof(char *));
             if (!nl) break;
             list = nl;
         }
@@ -1854,17 +2360,75 @@ static void load_syspkg_cache(void) {
     }
     pclose(p);
 
-    if (n == 0) { free(list); return; }
+    if (n == 0) { free(list); return 0; }
+    *out_list = list;
+    return n;
+}
 
-    syspkg_cache_free();
-    g_syspkg_list  = list;
-    g_syspkg_count = n;
-    logi("SysPkg: %d system package di-cache via cmd package", n);
+static void load_syspkg_cache(void) {
+    time_t now = time(NULL);
+    if (g_syspkg_ts > 0 && (now - g_syspkg_ts) < SYSPKG_CACHE_S) return;
+    g_syspkg_ts = now;   /* set sebelum popen agar tidak hammer saat gagal */
+
+    char **sys_list  = NULL; int sys_n  = 0;
+    char **user_list = NULL; int user_n = 0;
+    sys_n  = pkg_list_load("cmd package list packages -s 2>/dev/null", &sys_list);
+    user_n = pkg_list_load("cmd package list packages -3 2>/dev/null", &user_list);
+
+    if (sys_n == 0 && user_n == 0) {
+        pkg_list_free(sys_list, sys_n);
+        pkg_list_free(user_list, user_n);
+        return;   /* keep whatever cache we already had */
+    }
+
+    /* Swap in each list that succeeded; keep the old copy of a list that
+     * failed this round rather than dropping a still-useful cache. */
+    if (sys_n > 0) {
+        pkg_list_free(g_syspkg_list, g_syspkg_count);
+        g_syspkg_list  = sys_list;
+        g_syspkg_count = sys_n;
+    } else {
+        pkg_list_free(sys_list, sys_n);
+    }
+    if (user_n > 0) {
+        pkg_list_free(g_userpkg_list, g_userpkg_count);
+        g_userpkg_list  = user_list;
+        g_userpkg_count = user_n;
+    } else {
+        pkg_list_free(user_list, user_n);
+    }
+    logi("SysPkg: %d system + %d user package di-cache via cmd package",
+         g_syspkg_count, g_userpkg_count);
+}
+
+/* Classify a (colon-stripped) process base name against the cached
+ * package lists. Returns 0 = not in any list, 1 = system package,
+ * 2 = user package. Exact matches win over parent-package matches so a
+ * separately-installed subpackage keeps its own classification — the
+ * same precedence the old cmd-package-path dot-walk had. */
+static int pkg_cache_lookup(const char *base) {
+    if (!base || !base[0]) return 0;
+    for (int i = 0; i < g_syspkg_count; i++)
+        if (strcmp(base, g_syspkg_list[i]) == 0) return 1;
+    for (int i = 0; i < g_userpkg_count; i++)
+        if (strcmp(base, g_userpkg_list[i]) == 0) return 2;
+
+    char cand[256];
+    strncpy(cand, base, 255); cand[255] = '\0';
+    for (;;) {
+        char *dot = strrchr(cand, '.');
+        if (!dot) return 0;
+        *dot = '\0';
+        for (int i = 0; i < g_syspkg_count; i++)
+            if (strcmp(cand, g_syspkg_list[i]) == 0) return 1;
+        for (int i = 0; i < g_userpkg_count; i++)
+            if (strcmp(cand, g_userpkg_list[i]) == 0) return 2;
+    }
 }
 
 static bool is_system_package_cached(const char *name) {
-    if (g_syspkg_count == 0) load_syspkg_cache();
-    if (g_syspkg_count == 0) return false;
+    if (g_syspkg_count == 0 && g_userpkg_count == 0) load_syspkg_cache();
+    if (g_syspkg_count == 0 && g_userpkg_count == 0) return false;
 
     /* Buang suffix ':' (alias proses) */
     char base[256];
@@ -1872,17 +2436,7 @@ static bool is_system_package_cached(const char *name) {
     char *colon = strchr(base, ':');
     if (colon) *colon = '\0';
 
-    /* Walk dot-segments: cocokkan exact dulu, lalu induknya
-     * (mis. com.google.android.gms.ui → com.google.android.gms). */
-    char cand[256];
-    strncpy(cand, base, 255); cand[255] = '\0';
-    for (;;) {
-        for (int i = 0; i < g_syspkg_count; i++)
-            if (strcmp(cand, g_syspkg_list[i]) == 0) return true;
-        char *dot = strrchr(cand, '.');
-        if (!dot) return false;
-        *dot = '\0';
-    }
+    return pkg_cache_lookup(base) == 1;
 }
 
 /* ================================================================
@@ -2088,7 +2642,10 @@ static void classify_queue_requeue(const char *name, int attempts) {
  * baris metadata. Tetap memakai PackageManager service yang sama,
  * jadi akurasi setara. */
 static bool classify_try(const char *pkg, bool *is_system) {
-    char cmd[300];
+    /* P2-13: pkg can be up to 255 bytes — 2x pkg + the fixed command
+     * text needs up to 564 bytes, so size the buffer for it instead of
+     * relying on silent truncation. */
+    char cmd[600];
     snprintf(cmd, sizeof(cmd),
              "cmd package path %s 2>/dev/null || pm path %s 2>/dev/null",
              pkg, pkg);
@@ -2168,12 +2725,30 @@ static void classify_dumpsys_drain(void) {
         char candidate[256];
         strncpy(candidate, pkg, 255); candidate[255] = '\0';
         bool parsed = false, is_system = false;
-        for (;;) {
-            parsed = classify_try(candidate, &is_system);
-            if (parsed) break;
-            char *dot = strrchr(candidate, '.');
-            if (!dot) break; /* nothing shorter left to try */
-            *dot = '\0';
+        const char *via = "";
+
+        /* 1) Cached package lists first — zero fork(). With both the
+         * system (-s) and user (-3) lists in memory, almost every queued
+         * name resolves here, including process aliases whose parent
+         * package is installed (pkg_cache_lookup dot-walks by itself). */
+        int cached = pkg_cache_lookup(pkg);
+        if (cached == 1 || cached == 2) {
+            parsed    = true;
+            is_system = (cached == 1);
+            via       = " via cached package list";
+        } else {
+            /* 2) Fallback: `cmd package path` with dot-walking — only for
+             * names absent from both lists (cache failed to load, or a
+             * genuinely un-lookupable alias). */
+            for (;;) {
+                parsed = classify_try(candidate, &is_system);
+                if (parsed) break;
+                char *dot = strrchr(candidate, '.');
+                if (!dot) break; /* nothing shorter left to try */
+                *dot = '\0';
+            }
+            if (parsed && strcmp(candidate, pkg))
+                via = " via parent lookup";
         }
 
         if (parsed) {
@@ -2181,8 +2756,7 @@ static void classify_dumpsys_drain(void) {
             if (applied > 0) {
                 logi("Classify: [%s] confirmed category=%d (SYSTEM=%s)%s, applied to %d entr%s",
                      pkg, is_system ? 1 : 2, is_system ? "yes" : "no",
-                     strcmp(candidate, pkg) ? " via parent lookup" : "",
-                     applied, applied == 1 ? "y" : "ies");
+                     via, applied, applied == 1 ? "y" : "ies");
             } else {
                 logw("Classify: [%s] confirmed category=%d (SYSTEM=%s) but no matching entries found",
                      pkg, is_system ? 1 : 2, is_system ? "yes" : "no");
@@ -2243,6 +2817,48 @@ static void category_reconfirm_sweep(void) {
  * by older, less relevant entries that happened to fill the table first. */
 #define EVICT_CONFIRMED_BONUS 80
 
+/* Forward decl — full definition lives in the cgroup section below. */
+static bool cgroup_write(pid_t pid, const char *file, const char *val);
+
+/* An evicted/pruned score entry takes its in-memory-only cg_high_set /
+ * cg_low_set flags with it — and once the flags are gone, the 15-minute
+ * safety-net in pin_squeeze_pass() can never find the process again to
+ * restore memory.high -> "max" / memory.low -> "0". A squeeze or pin
+ * applied just before the eviction would then stay in force forever.
+ * Before the entry is dropped, scan /proc for any live process still
+ * carrying this name and restore the cgroup defaults. Rare (only fires
+ * when the table recycles a slot while a limit is active) and cheap
+ * (one /proc walk, same as a single enumerate_procs() pass). */
+static void score_evict_release_cgroups(AppScore *victim) {
+    if (!victim || !victim->name[0]) return;
+    if (!victim->cg_high_set && !victim->cg_low_set) return;
+
+    DIR *d = opendir("/proc");
+    if (!d) return;
+    struct dirent *de;
+    char pname[256];
+    int released = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (!isdigit((unsigned char)de->d_name[0])) continue;
+        pid_t pid = (pid_t)atoi(de->d_name);
+        if (pid <= 1) continue;
+        /* Same name source as enumerate_procs(): first token of
+         * /proc/<pid>/cmdline, so this matches exactly the processes the
+         * flags were set on. */
+        if (proc_cmdline(pid, pname, sizeof(pname)) != 0 || !pname[0]) continue;
+        if (strcmp(pname, victim->name) != 0) continue;
+        if (victim->cg_high_set &&
+            cgroup_write(pid, "memory.high", "max")) released++;
+        if (victim->cg_low_set &&
+            cgroup_write(pid, "memory.low", "0")) released++;
+    }
+    closedir(d);
+    if (released > 0)
+        logi("ScoreEvict: restored memory.high/memory.low defaults on [%s] "
+             "(%d cgroup write(s)) before dropping the entry",
+             victim->name, released);
+}
+
 static AppScore *score_alloc_slot(void) {
     if (g_score_count < SCORE_MAX_APPS)
         return &g_scores[g_score_count++];
@@ -2260,6 +2876,9 @@ static AppScore *score_alloc_slot(void) {
          "fg_count=%d table=%d/%d)",
          g_scores[min_idx].name, min_key, g_scores[min_idx].category_confirmed ? 1 : 0,
          g_scores[min_idx].fg_count, g_score_count, SCORE_MAX_APPS);
+    /* The caller memsets this slot on return — release any live cgroup
+     * limit FIRST, while the flags are still readable. */
+    score_evict_release_cgroups(&g_scores[min_idx]);
     return &g_scores[min_idx];
 }
 
@@ -2428,7 +3047,20 @@ static void score_save_full(void) {
         bool wrote_hdr = false;
         for (int i = 0; i < g_score_count; i++) {
             AppScore *s = &g_scores[i];
-            if (s->fg_count == 0) continue;
+            /* Pure-background apps (bloatware/services that NEVER reach
+             * the foreground) accumulate exactly the signals that matter
+             * for them: restart_count (bounce history feeding
+             * BOUNCE_SUPPRESS_RC), avg_swap_kb, and a dumpsys-confirmed
+             * category. Blanket-dropping every fg_count==0 entry on
+             * consolidation erased that history — the worst bouncers
+             * then lost their kill suppression after a daemon restart.
+             * Keep the entry as long as it carries at least one of
+             * those signals. */
+            if (s->fg_count == 0 &&
+                s->restart_count == 0 &&
+                s->avg_swap_kb <= 0 &&
+                !s->category_confirmed)
+                continue;
             int c = s->category;
             if (c < 0 || c > 2) c = classify_score_cat(s->name);
             if (c != cat) continue;
@@ -2479,7 +3111,7 @@ static void score_save_full(void) {
 
     g_scores_dirty = false;
 
-    logi("Scores: full save %d entries (v8)", saved);
+    logi("Scores: full save %d entries (v9)", saved);
 }
 
 /* Append only entries changed since the last flush to a small journal
@@ -2538,6 +3170,10 @@ static void score_compact(void) {
     for (int i = 0; i < g_score_count; i++) {
         AppScore *s = &g_scores[i];
         if (s->raw_last_fg_do_not_read_directly != 0 && (now - s->raw_last_fg_do_not_read_directly) > SCORE_STALE_PRUNE_S) {
+            /* Same leak as slot eviction: a pruned entry's cg_high_set/
+             * cg_low_set flags die with it, so restore any live cgroup
+             * limit before the entry is dropped from the table. */
+            score_evict_release_cgroups(s);
             pruned++;
             continue;
         }
@@ -2594,7 +3230,8 @@ static void score_load(bool read_only) {
                             pkg, &cnt, &ts, &rc, &avg_sw, &ses, &cat,
                             &confirmed_field, &dckills, &adpkills,
                             &first_seen_ts, &avg_session_dur, &confirmed_at_ts);
-        if (fields < 3 || cnt <= 0) continue;
+        if (fields < 3) continue;
+        if (cnt < 0) cnt = 0;   /* defensive: %d can parse a negative */
         if (fields < 5) { rc = 0; avg_sw = 0; }
         if (fields < 6) { ses = 0; }
         if (fields < 7) { cat = classify_score_cat(pkg); }
@@ -2612,6 +3249,14 @@ static void score_load(bool read_only) {
             dckills = confirmed_field;
             confirmed_field = 0;
         }
+        /* fg_count == 0 is a legal, persistable state (v9+): background-only
+         * apps (never foregrounded bloatware/services) keep their bounce
+         * history, swap EMA and confirmed category in the file. Accept the
+         * line as long as it carries any of those signals; entries with
+         * none of them are still noise and get dropped. */
+        if (cnt == 0 && rc <= 0 && avg_sw <= 0 &&
+            !(has_confirmed_field && confirmed_field == 1))
+            continue;
         /* v7 adds first_seen as an 11th field, v8 adds
          * avg_session_duration_s as a 12th. Any line with fewer fields
          * (older format, or a short/legacy line) simply leaves the newer
@@ -2677,7 +3322,8 @@ static void score_load(bool read_only) {
                             pkg, &cnt, &ts, &rc, &avg_sw, &ses, &cat,
                             &confirmed_field, &dckills, &adpkills,
                             &first_seen_ts, &avg_session_dur, &confirmed_at_ts);
-        if (fields < 3 || cnt <= 0) continue;
+        if (fields < 3) continue;
+        if (cnt < 0) cnt = 0;   /* defensive: %d can parse a negative */
         if (fields < 5) { rc = 0; avg_sw = 0; }
         if (fields < 6) { ses = 0; }
         if (fields < 7) { cat = classify_score_cat(pkg); }
@@ -2690,6 +3336,12 @@ static void score_load(bool read_only) {
             dckills = confirmed_field;
             confirmed_field = 0;
         }
+        /* Same background-only acceptance rule as the base-file loop
+         * above: cnt == 0 journal lines are valid when they carry bounce
+         * history, a swap EMA, or a trusted confirmed category. */
+        if (cnt == 0 && rc <= 0 && avg_sw <= 0 &&
+            !(has_confirmed_field && confirmed_field == 1))
+            continue;
         if (cat < 0 || cat > 2) cat = classify_score_cat(pkg);
 
         AppScore *s = score_lookup(pkg);
@@ -3144,10 +3796,24 @@ static int enumerate_procs(ProcInfo *tbl, int maxn) {
         if (!isdigit((unsigned char)de->d_name[0])) continue;
         pid_t pid = (pid_t)atol(de->d_name); if (pid <= 1) continue;
         ProcInfo *p = &tbl[cnt]; memset(p, 0, sizeof(*p)); p->pid = pid;
+        /* P1 (snapshot consistency): bracket every /proc/<pid> read with
+         * a starttime sample taken BEFORE the first read and re-checked
+         * AFTER the last one. If the PID was recycled in between, the
+         * two samples differ and the whole entry is dropped — cmdline,
+         * oom_adj and memory stats can then never come from two
+         * different processes, and no partial entry reaches the kill
+         * policy. starttime == 0 means the process is already gone (or
+         * unreadable) and is also dropped. Global-state side effects
+         * (fg history, score stubs, bounce windows) run only after the
+         * snapshot has been verified. */
+        unsigned long long st_before = read_proc_starttime(pid);
+        if (st_before == 0) continue;
         if (proc_cmdline(pid, p->name, sizeof(p->name)) < 0) continue;
         if (!p->name[0]) continue;
         p->oom_adj       = proc_oom_adj(pid);
         proc_mem_stats(pid, &p->rss_kb, &p->swap_kb);
+        if (read_proc_starttime(pid) != st_before) continue;  /* recycled / exited */
+        p->starttime     = st_before;   /* identity used by kill_proc_verified() */
         p->prio          = classify(p);
         p->raw_last_fg_do_not_read_directly       = get_last_fg(p->name);
         check_bounced(p->name);
@@ -3224,6 +3890,29 @@ static void track_foreground(ProcInfo *tbl, int cnt) {
 
             if (genuine_fg) {
                 s->fg_hold_last_genuine_t = now;
+                /* P1-7: the app is the true foreground — release any
+                 * memory.high squeeze limit immediately; a constrained
+                 * foreground app is direct user-visible jank. */
+                if (s->cg_high_set) {
+                    bool released = false, found_proc = false;
+                    for (int j = 0; j < cnt; j++) {
+                        if (strcmp(tbl[j].name, n) != 0) continue;
+                        found_proc = true;
+                        released = cgroup_write(tbl[j].pid, "memory.high", "max");
+                        break;
+                    }
+                    if (released || !found_proc) {
+                        s->cg_high_set = false;
+                        s->cg_high_set_t = 0;
+                        s->cg_high_effective = false;
+                        logi("SqueezeRelease: [%s] returned to foreground — "
+                             "memory.high cleared%s", n,
+                             found_proc ? "" : " (process gone)");
+                    } else {
+                        logw("SqueezeRelease: [%s] foreground write failed — "
+                             "will retry next pass", n);
+                    }
+                }
             } else if (s->fg_hold_start != 0 &&
                        (s->fg_hold_last_genuine_t == 0 ||
                         (now - s->fg_hold_last_genuine_t) > FG_HOLD_WOBBLE_TOLERANCE_S)) {
@@ -3259,9 +3948,10 @@ static void track_foreground(ProcInfo *tbl, int cnt) {
         }
 
         AppScore *rs = score_lookup(n);
-        if (rs && rs->cg_high_set) {
-            cgroup_write(tbl[i].pid, "memory.high", "max");
+        if (rs && rs->cg_high_set &&
+            cgroup_write(tbl[i].pid, "memory.high", "max")) {
             rs->cg_high_set = false;
+            rs->cg_high_set_t = 0;
             logi("SqueezeRelease: [%s] memory.high cleared on genuine fg", n);
         }
 
@@ -3282,38 +3972,25 @@ static void track_foreground(ProcInfo *tbl, int cnt) {
  * ================================================================ */
 
 static bool confirm_true_foreground(const char *pkg) {
-    FILE *fp = popen("/system/bin/dumpsys window windows 2>/dev/null", "r");
+    FILE *fp = popen("cmd activity top 2>/dev/null", "r");
     if (!fp) return true;
     char line[512];
-    bool found_focus_line = false, matched = false;
+    bool found_activity = false, matched = false;
     while (fgets(line, sizeof(line), fp)) {
-        char *p = strstr(line, "mCurrentFocus=");
-        if (!p) continue;
-        found_focus_line = true;
-        char *slash = strchr(p, '/');
-        if (slash) {
-            char *pkg_end = slash, *pkg_start = slash;
-            while (pkg_start > line && pkg_start[-1] != ' ' && pkg_start[-1] != '{')
-                pkg_start--;
-            size_t len = (size_t)(pkg_end - pkg_start);
-            if (len > 0 && len < 200 &&
-                strncmp(pkg_start, pkg, len) == 0 && pkg[len] == '\0')
-                matched = true;
-        }
-        break; /* first mCurrentFocus= line is authoritative */
+        if (!strstr(line, "ACTIVITY") && !strstr(line, "topResumedActivity") &&
+            !strstr(line, "mResumedActivity")) continue;
+        found_activity = true;
+        if (strstr(line, pkg)) { matched = true; break; }
     }
     pclose(fp);
-    return found_focus_line ? matched : true; /* fail open on a missing line */
+    return found_activity ? matched : true; /* fail open on unsupported output */
 }
 
 static bool find_true_foreground(ProcInfo *tbl, int cnt, char *out, size_t outsz) {
     for (int i = 0; i < cnt; i++) {
         if (tbl[i].oom_adj != ADJ_FOREGROUND) continue;
         const char *n = tbl[i].name;
-        /* Skip absolute-path native binaries (e.g. Termux bash) */
-        if (n[0] == '/') continue;
-        /* Skip persistent background services (GMS persistent, etc.) */
-        if (strstr(n, ".persistent")) continue;
+        if (!is_fg_trackable(n)) continue;
 
         strncpy(out, n, outsz - 1);
         out[outsz - 1] = '\0';
@@ -3328,7 +4005,7 @@ static bool find_true_foreground(ProcInfo *tbl, int cnt, char *out, size_t outsz
 
 #define PIN_STICKY_PCT     20   /* sticky bonus = 20% of SCORE_MAX */
 #define PIN_STICKY_BONUS   ((SCORE_MAX * PIN_STICKY_PCT) / 100)
-static char    g_prev_pinned[RETAIN_MAX_N][64];
+static char    g_prev_pinned[RETAIN_MAX_N][256];
 static int     g_prev_pinned_n = 0;
 static time_t  g_kill_roi_log_t = 0;
 
@@ -3351,7 +4028,7 @@ static void oom_pin_retained(ProcInfo *tbl, int cnt, int avail_pct) {
     int  retained = 0;
     int  cg_low_ok = 0;
     char retained_names[512] = "";
-    char local_pinned_name[RETAIN_MAX_N][64];
+    char local_pinned_name[RETAIN_MAX_N][256];
     int  local_pinned_count = 0;
 
     /* Shared "commit this candidate as pinned" step — identical for both
@@ -3757,41 +4434,124 @@ static bool cgroup_write(pid_t pid, const char *file, const char *val) {
 }
 
 #define LOGCAT_DRAIN_MAX_LINES 40
-static FILE *g_logcat_fp = NULL;
-static bool  g_logcat_failed = false;
 
-static FILE *g_logcat_events_fp = NULL;
-static bool  g_logcat_events_failed = false;
+/* logcat children are spawned with pipe2()+fork()+execvp() instead of
+ * popen() so shutdown can never hang: pclose() blocks in waitpid() until
+ * the child really exits, and a logcat with nothing new to log only
+ * notices a dead pipe on its NEXT write (SIGPIPE) — so `lmk_engine
+ * --stop` could sit in pclose() indefinitely and strand orphan logcat
+ * processes. With the pid stored we can SIGTERM first, wait briefly,
+ * then SIGKILL before reaping. PR_SET_PDEATHSIG additionally guarantees
+ * the child dies with the daemon even if the daemon crashes without
+ * running its cleanup path. */
+typedef struct {
+    FILE *fp;      /* NULL = not running */
+    pid_t pid;     /* <0 = no live child */
+    bool  failed;  /* give up for this run after a spawn/EOF failure */
+} LogcatWatch;
+
+static LogcatWatch g_logcat_sys    = { NULL, -1, false };
+static LogcatWatch g_logcat_events = { NULL, -1, false };
+
+static bool logcat_spawn(LogcatWatch *w, char *const argv[]) {
+    int pfd[2];
+    if (pipe2(pfd, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+
+    pid_t parent_pid = getpid();
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]); close(pfd[1]);
+        return false;
+    }
+    if (pid == 0) {
+        /* Child. Signal dispositions inherited from the daemon's handler
+         * would swallow the SIGTERM we send at shutdown (the handler only
+         * sets flags) — reset to default before exec. */
+        close(pfd[0]);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT,  SIG_DFL);
+        signal(SIGHUP,  SIG_DFL);
+        int nfd = open("/dev/null", O_RDWR);
+        if (nfd >= 0) {
+            dup2(nfd, STDIN_FILENO);
+            dup2(nfd, STDERR_FILENO);   /* was "2>/dev/null" in the popen cmd */
+            if (nfd > STDERR_FILENO) close(nfd);
+        }
+        if (pfd[1] != STDOUT_FILENO) {
+            dup2(pfd[1], STDOUT_FILENO);
+            close(pfd[1]);
+        }
+        prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+        if (getppid() != parent_pid) _exit(127);  /* parent died mid-fork */
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    close(pfd[1]);
+    FILE *fp = fdopen(pfd[0], "r");
+    if (!fp) {
+        close(pfd[0]);
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) { }
+        return false;
+    }
+    w->fp  = fp;
+    w->pid = pid;
+    return true;
+}
+
+/* Kill + reap a logcat child without ever blocking indefinitely:
+ * SIGTERM first (logcat exits cleanly on it), a bounded ~1s WNOHANG
+ * poll, then SIGKILL + blocking waitpid (which cannot hang). */
+static void logcat_watch_stop(LogcatWatch *w) {
+    if (w->fp) { fclose(w->fp); w->fp = NULL; }
+    if (w->pid > 0) {
+        kill(w->pid, SIGTERM);
+        bool reaped = false;
+        for (int i = 0; i < 100 && !reaped; i++) {
+            pid_t r = waitpid(w->pid, NULL, WNOHANG);
+            if (r == w->pid) {
+                reaped = true;
+            } else if (r < 0) {
+                if (errno == EINTR) continue;
+                break;   /* ECHILD — already reaped elsewhere */
+            } else {
+                usleep(10000);
+            }
+        }
+        if (!reaped) {
+            kill(w->pid, SIGKILL);
+            while (waitpid(w->pid, NULL, 0) < 0 && errno == EINTR) { }
+        }
+        w->pid = -1;
+    }
+}
 
 static void logcat_watch_init(void) {
-    if (!g_logcat_fp && !g_logcat_failed) {
-        g_logcat_fp = popen("logcat -b system -v brief "
-                             "ActivityManager:I lowmemorykiller:V *:S 2>/dev/null", "r");
-        if (!g_logcat_fp) {
-            logw("ExternalKill: logcat popen failed — attribution disabled "
-                 "for this run (%s)", strerror(errno));
-            g_logcat_failed = true;
-        } else {
-            int fd = fileno(g_logcat_fp);
-            int flags = fcntl(fd, F_GETFL, 0);
-            if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (!g_logcat_sys.fp && !g_logcat_sys.failed) {
+        char *const argv[] = { "logcat", "-b", "system", "-v", "brief",
+                               "ActivityManager:I", "lowmemorykiller:V",
+                               "*:S", NULL };
+        if (logcat_spawn(&g_logcat_sys, argv)) {
             logi("ExternalKill: logcat attribution armed (system)");
+        } else {
+            logw("ExternalKill: logcat spawn failed — attribution disabled "
+                 "for this run (%s)", strerror(errno));
+            g_logcat_sys.failed = true;
         }
     }
-    if (!g_logcat_events_fp && !g_logcat_events_failed) {
-        g_logcat_events_fp = popen("logcat -b events -v brief "
-                                    "am_kill:I am_proc_died:I am_low_memory:I *:S 2>/dev/null", "r");
-        if (!g_logcat_events_fp) {
-            logw("ExternalKill: logcat events-buffer popen failed — "
-                 "events-buffer attribution disabled for this run (%s)",
-                 strerror(errno));
-            g_logcat_events_failed = true;
-        } else {
-            int fd = fileno(g_logcat_events_fp);
-            int flags = fcntl(fd, F_GETFL, 0);
-            if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (!g_logcat_events.fp && !g_logcat_events.failed) {
+        char *const argv[] = { "logcat", "-b", "events", "-v", "brief",
+                               "am_kill:I", "am_proc_died:I",
+                               "am_low_memory:I", "*:S", NULL };
+        if (logcat_spawn(&g_logcat_events, argv)) {
             logi("ExternalKill: logcat attribution armed (events, "
                  "UNVERIFIED tag names — confirm with raw capture)");
+        } else {
+            logw("ExternalKill: logcat events-buffer spawn failed — "
+                 "events-buffer attribution disabled for this run (%s)",
+                 strerror(errno));
+            g_logcat_events.failed = true;
         }
     }
 }
@@ -3812,24 +4572,25 @@ static bool pkg_name_matches_line(const char *line, const char *name) {
 }
 
 /* Shared by both logcat_kill_watch() (system buffer) and
- * logcat_kill_watch_events() (events buffer) — drains one FILE*, matches
+ * logcat_kill_watch_events() (events buffer) — drains one watch, matches
  * kill-looking lines against live tracked app names, logs + records. */
-static void logcat_drain_and_attribute(FILE **fp, bool *failed_flag,
+static void logcat_drain_and_attribute(LogcatWatch *w,
                                         ProcInfo *tbl, int cnt,
                                         const char *source_label) {
-    if (!*fp) return;
+    if (!w->fp) return;
     char line[512];
     int drained = 0;
     while (drained < LOGCAT_DRAIN_MAX_LINES) {
-        if (!fgets(line, sizeof(line), *fp)) {
-            if (feof(*fp)) {
-                pclose(*fp);
-                *fp = NULL;
-                *failed_flag = true;
+        if (!fgets(line, sizeof(line), w->fp)) {
+            if (feof(w->fp)) {
+                /* Child exited — fully close + reap it so it can't linger
+                 * as a zombie, then disable this source for the run. */
+                logcat_watch_stop(w);
+                w->failed = true;
                 logw("ExternalKill: logcat %s stream ended — attribution "
                      "disabled for this run", source_label);
             } else {
-                clearerr(*fp); /* benign EAGAIN — no data right now */
+                clearerr(w->fp); /* benign EAGAIN — no data right now */
             }
             break;
         }
@@ -3858,8 +4619,8 @@ static void logcat_drain_and_attribute(FILE **fp, bool *failed_flag,
 static void logcat_kill_watch(ProcInfo *tbl, int cnt) {
     logcat_watch_init();
 
-    logcat_drain_and_attribute(&g_logcat_fp, &g_logcat_failed, tbl, cnt, "system");
-    logcat_drain_and_attribute(&g_logcat_events_fp, &g_logcat_events_failed, tbl, cnt, "events");
+    logcat_drain_and_attribute(&g_logcat_sys, tbl, cnt, "system");
+    logcat_drain_and_attribute(&g_logcat_events, tbl, cnt, "events");
 }
 
 #define UNATTRIB_SEEN_WINDOW_S       6
@@ -3958,11 +4719,15 @@ static bool try_squeeze_then_reclaim(ProcInfo *p, long *freed_out) {
         char valbuf[32];
         snprintf(valbuf, sizeof(valbuf), "%ld", high_target_kb * 1024);
         if (cgroup_write(p->pid, "memory.high", valbuf)) {
-            if (cas) { cas->cg_high_set = true; cas->cg_high_set_t = time(NULL); }
+            if (cas) {
+                if (!cas->cg_high_set) cas->cg_high_set_t = time(NULL);
+                cas->cg_high_set = true;
+            }
             long rss_after = 0, swap_after = 0;
             proc_mem_stats(p->pid, &rss_after, &swap_after);
             long freed = (rss_after > 0) ? (p->rss_kb - rss_after) : 0;
             if (freed >= RECLAIM_MIN_FREED_KB) {
+                if (cas) cas->cg_high_effective = true;   /* P1-7 */
                 if (freed_out) *freed_out = freed;
                 p->rss_kb = rss_after;
                 logi("CgSqueeze: [%s] freed=%ldMB via memory.high (target=%d%%)",
@@ -3970,6 +4735,23 @@ static bool try_squeeze_then_reclaim(ProcInfo *p, long *freed_out) {
                 kswapd_note_disruptive_event();
                 return true;
             }
+            /* P1-7: the limit was installed but produced no meaningful
+             * reclaim. Mark it ineffective so the safety net releases
+             * it after SQUEEZE_HIGH_FAILED_RELEASE_S instead of the
+             * full 15-minute window, then fall through to reclaim. */
+            if (cas) cas->cg_high_effective = false;
+            logi("CgSqueeze: [%s] memory.high installed but freed <%dMB — "
+                 "short-release timer armed",
+                 p->name, RECLAIM_MIN_FREED_KB/1024);
+        } else {
+            /* P1-7: install failed. If a previous limit is still in
+             * place (cg_high_set already true) it remains tracked — a
+             * failed re-tighten does not remove it; never lose that
+             * state. */
+            logw("CgSqueeze: [%s] memory.high write failed — limit %s",
+                 p->name,
+                 (cas && cas->cg_high_set) ? "unchanged (previous still active)"
+                                           : "not applied");
         }
     }
     long reclaimed = try_reclaim(p, cas);
@@ -3984,11 +4766,54 @@ static time_t g_last_pin_squeeze_t = 0;
 
 #define SQUEEZE_PIN_INTERVAL_S     60
 #define SQUEEZE_PIN_SKIP_ACTIVE_S  30
+#define SQUEEZE_HIGH_MAX_AGE_S    (15 * 60)
+#define SQUEEZE_HIGH_FAILED_RELEASE_S 90  /* P1-7: ineffective limit max age */
 
 static void pin_squeeze_pass(ProcInfo *tbl, int cnt) {
     time_t now = time(NULL);
     if (now - g_last_pin_squeeze_t < SQUEEZE_PIN_INTERVAL_S) return;
     g_last_pin_squeeze_t = now;
+
+    /* P1-7: release lingering memory.high limits. Three triggers, in
+     * order of aggressiveness:
+     *   1. pressure eased (ZRAM < 50% — the graduated squeeze curve is
+     *      flat-zero below that, so limits buy nothing at all),
+     *   2. ineffective squeeze (installed but freed < RECLAIM_MIN_FREED_KB)
+     *      held past SQUEEZE_HIGH_FAILED_RELEASE_S (90 s, was 15 min),
+     *   3. any limit held past SQUEEZE_HIGH_MAX_AGE_S (15 min hard cap).
+     * The old code only had (3), leaving pointless-but-harmful limits
+     * pinned for the full 15 minutes. */
+    for (int i = 0; i < g_score_count; i++) {
+        AppScore *as = &g_scores[i];
+        if (!as->cg_high_set || as->cg_high_set_t <= 0) continue;
+
+        bool pressure_eased = g_zram_used_pct < 50;
+        int  max_age_s = as->cg_high_effective ? SQUEEZE_HIGH_MAX_AGE_S
+                                               : SQUEEZE_HIGH_FAILED_RELEASE_S;
+        if (!pressure_eased && (now - as->cg_high_set_t) < max_age_s) continue;
+        const char *why = pressure_eased ? "pressure-eased" :
+                          (as->cg_high_effective ? "15-minute"
+                                                 : "ineffective-squeeze");
+        bool process_found = false;
+        bool released = false;
+        for (int j = 0; j < cnt; j++) {
+            if (strcmp(tbl[j].name, as->name) != 0) continue;
+            process_found = true;
+            released = cgroup_write(tbl[j].pid, "memory.high", "max");
+            break;
+        }
+        if (released || !process_found) {
+            as->cg_high_set = false;
+            as->cg_high_set_t = 0;
+            as->cg_high_effective = false;
+            logi("SqueezeRelease: [%s] memory.high cleared by %s safety-net",
+                 as->name, why);
+        } else {
+            logw("SqueezeRelease: [%s] %s safety-net write failed; will retry",
+                 as->name, why);
+        }
+    }
+
     /* Cheap early-out: graduated curve returns 0 below 50% anyway, no
      * point doing the table walk/lookups at all when there's no chance
      * of a squeeze happening. */
@@ -4021,6 +4846,11 @@ static void pin_squeeze_pass(ProcInfo *tbl, int cnt) {
 
 #define SQUEEZE_KILL_GRACE_S   45
 
+/* P1-6: is_critical means avail_pct < FREE_CRIT_PCT — NOTHING else.
+ * It is the only condition that legitimately skips the squeeze/ROI
+ * gates (real OOM proximity outranks keeping apps warm). RAM_LOW
+ * (avail < FREE_LOW_PCT) must still pass through the grace window,
+ * squeeze attempt and kill-ROI gate before a kill happens. */
 static bool should_spare_kill(ProcInfo *p, bool is_critical, long *freed_out) {
     if (freed_out) *freed_out = 0;
     if (is_critical) return false;
@@ -4087,7 +4917,10 @@ static long do_kill(ProcInfo *tbl, int cnt, long target_kb,
             freed += reclaimed;
             continue;
         }
-        if (kill(p->pid, SIGKILL) == 0) {
+        /* P0-1: verified SIGKILL — the PID must still be the exact
+         * process captured by enumerate_procs(). */
+        int krc = kill_proc_verified(p);
+        if (krc == 0) {
             freed += p->rss_kb;
             record_kill(p);
             logk("RAM pid=%-6d prio=%d sc=%-4d rc=%-2d fg_age=%-4lds rss=%4ldMB sw=%4ldMB [%s]",
@@ -4096,9 +4929,34 @@ static long do_kill(ProcInfo *tbl, int cnt, long target_kb,
                  p->rss_kb/1024, p->avg_swap_kb/1024, p->name);
             usleep(30000);
         }
+        /* krc == 1: identity changed/gone — stale entry, skip.
+         * krc == -1: signal failed (EPERM…) — skip, same as before. */
     }
     return freed;
 }
+
+/* P1-5: full reset sweep — consistent with the normal kill policy
+ * instead of a protection bypass. Updated (TODO v1.1): the sweep now
+ * honours the same recency + score protect window as do_kill() — an
+ * app still inside score_protect_window() of its last foreground time
+ * is not stale and survives; the sweep ages out only what is genuinely
+ * stale once the 12 h gate + 30 min deep-idle conditions are met.
+ * Every protection applies:
+ *   - recency / score protect window    (recently_used / score_protected)
+ *   - visible/foreground processes      (never)
+ *   - rank-exempt / PRIO_NEVER          (never)
+ *   - cooldown after kill               (shared with all paths)
+ *   - retention / pinned state          (a scheduled maintenance sweep
+ *                                        never wipes pinned apps)
+ *   - tier1-background hot spare        (RESET_SPARE_HOT_N survivors,
+ *                                        same philosophy as T3)
+ *   - minimum benefit floor             (no churn for <20MB procs)
+ *   - hard target cap                    (RESET_MAX_KILLS per sweep)
+ * Skipped counters in the summary line make each decision visible
+ * from the log, per the "keputusan kill dapat dijelaskan" criterion. */
+#define RESET_MIN_RSS_KB       (20 * 1024)
+#define RESET_MAX_KILLS        24
+#define RESET_SPARE_HOT_N      2
 
 static void full_reset_sweep(ProcInfo *tbl, int cnt) {
     time_t now = time(NULL);
@@ -4111,14 +4969,67 @@ static void full_reset_sweep(ProcInfo *tbl, int cnt) {
         return;
 
     g_reset_in_progress = true;
-    int  killed   = 0;
+    int  killed = 0, skipped_cd = 0, skipped_ret = 0;
+    int  skipped_hot = 0, skipped_small = 0, skipped_stale = 0;
+    int  skipped_recent = 0;
     long freed_kb = 0;
-    for (int i = 0; i < cnt; i++) {
+    int  hot_kept = 0;
+
+    for (int i = 0; i < cnt && killed < RESET_MAX_KILLS; i++) {
         ProcInfo *p = &tbl[i];
         if (p->prio == PRIO_NEVER)          continue;
         if (p->rank == RANK_EXEMPT)         continue;
-        if (p->oom_adj <= ADJ_VISIBLE_MAX)  continue; /* extra safety net */
-        if (kill(p->pid, SIGKILL) == 0) {
+        if (p->oom_adj <= ADJ_VISIBLE_MAX)  continue; /* visible/fg safety net */
+        if (is_never_kill_now(p))           continue; /* true fg — never */
+
+        /* cooldown after kill — shared with every other kill path */
+        if (recently_killed(p->name)) { skipped_cd++; continue; }
+
+        /* retention/pinned — same philosophy as the adaptive T3
+         * override: only critical RAM outranks retention, and a
+         * scheduled sweep is never critical RAM. */
+        if (is_actively_retained(p->name) && p->prio != PRIO_JUNK) {
+            logi("ResetSkip: [%s] reason=active_retention", p->name);
+            skipped_ret++; continue;
+        }
+
+        /* Recency + score protection, same policy as do_kill(): an app
+         * whose last foreground time is still inside its score-scaled
+         * protect window is NOT stale, whatever the sweep's age gate
+         * says. A sweep is never critical RAM, so the non-critical
+         * (FREE_HIGH_PCT) window applies. Higher-score apps get a
+         * longer window via score_protect_window(). */
+        time_t rec_dk = effective_fg_recency(p);
+        if (rec_dk > 0) {
+            int win = score_protect_window(p->name);
+            if ((now - rec_dk) < win) {
+                logi("ResetSkip: [%s] reason=%s score=%d win=%ds age=%lds",
+                     p->name,
+                     p->score >= SCORE_MAX / 2 ? "score_protected"
+                                               : "recently_used",
+                     p->score, win, (long)(now - rec_dk));
+                skipped_recent++; continue;
+            }
+        }
+
+        /* keep a couple of tier1-background apps alive so light
+         * multitasking survives the sweep (same idea as T3_SPARE_HOT_N) */
+        if (is_tier1_background(p) && hot_kept < RESET_SPARE_HOT_N) {
+            logi("ResetSkip: [%s] reason=hot_survivor", p->name);
+            skipped_hot++; hot_kept++; continue;
+        }
+
+        /* minimum benefit floor: churning a tiny process buys a
+         * relaunch cost with almost no reclaim */
+        if (p->rss_kb + p->swap_kb < RESET_MIN_RSS_KB) {
+            logi("ResetSkip: [%s] reason=below_min_rss rss+swap=%ldKB",
+                 p->name, p->rss_kb + p->swap_kb);
+            skipped_small++; continue;
+        }
+
+        /* P0-1: verified SIGKILL */
+        int krc = kill_proc_verified(p);
+        if (krc == 0) {
             freed_kb += p->rss_kb;
             killed++;
             record_kill(p);
@@ -4126,12 +5037,17 @@ static void full_reset_sweep(ProcInfo *tbl, int cnt) {
                  p->pid, p->prio, p->score, p->restart_count,
                  p->rss_kb/1024, p->avg_swap_kb/1024, p->name);
             usleep(30000);
+        } else if (krc == 1) {
+            skipped_stale++;
         }
     }
     g_reset_in_progress = false;
     g_last_full_reset_t = now;
-    logi("Reset: full flush complete — killed=%d freed=%ldMB, next eligible in %dh",
-         killed, freed_kb/1024, RESET_GATE_S/3600);
+    logi("Reset: sweep complete — killed=%d freed=%ldMB "
+         "(skipped: cd=%d retained=%d recent=%d hot=%d small=%d stale=%d), "
+         "next eligible in %dh",
+         killed, freed_kb/1024, skipped_cd, skipped_ret, skipped_recent,
+         skipped_hot, skipped_small, skipped_stale, RESET_GATE_S/3600);
 }
 
 /* ================================================================
@@ -4213,7 +5129,9 @@ static void zram_pressure_kill(ProcInfo *tbl, int cnt, int zram_used_pct) {
             }
             continue;
         }
-        if (kill(p->pid, SIGKILL) == 0) {
+        /* P0-1: verified SIGKILL */
+        int krc = kill_proc_verified(p);
+        if (krc == 0) {
             freed_swap += p->swap_kb;
             kills++;
             record_kill(p);
@@ -4264,7 +5182,9 @@ static void zram_pressure_kill(ProcInfo *tbl, int cnt, int zram_used_pct) {
                  (emerg_as->last_reclaim_t > 0 && (now - emerg_as->last_reclaim_t) < SQUEEZE_KILL_GRACE_S))) {
                 continue;
             }
-            if (kill(p->pid, SIGKILL) == 0) {
+            /* P0-1: verified SIGKILL */
+            int krc = kill_proc_verified(p);
+            if (krc == 0) {
                 freed_swap += p->swap_kb;
                 emerg_kills++;
                 record_kill(p);
@@ -4407,7 +5327,8 @@ static int adaptive_select_tier(MemInfo *mi, ZramInfo *z, bool *do_compact, bool
     int zpct    = z->used_pct;
     bool ram_low = mi->avail_pct < FREE_LOW_PCT;
 
-    bool ram_critical = mi->avail_pct < FREE_CRIT_PCT;
+    /* P1-6: single shared definition — see ram_state_critical(). */
+    bool ram_critical = ram_state_critical(mi);
     time_t now  = time(NULL);
 
     /* Trend detection */
@@ -4509,7 +5430,8 @@ static bool adaptive_kill_eligible(int tier, ProcInfo *p, MemInfo *mi, int zpct,
      * (RANK_EXEMPT/FOREGROUND guards). A small quota of RANK_HOT apps
      * is spared too, so light multitasking survives a critical sweep
      * instead of every retained app being wiped at once. */
-    bool ram_critical = mi->avail_pct < FREE_CRIT_PCT;
+    /* P1-6: single shared definition — see ram_state_critical(). */
+    bool ram_critical = ram_state_critical(mi);
 
     bool zram_critical = zpct >= ZRAM_CRIT_PCT;
 
@@ -4704,6 +5626,11 @@ static void adaptive_clean(ProcInfo *tbl, int cnt, MemInfo *mi, ZramInfo *z) {
 
     int zpct    = z->used_pct;
     bool ram_low = mi->avail_pct < FREE_LOW_PCT;
+    /* P1-6: the should_spare_kill() bypass argument is RAM-CRITICAL,
+     * not RAM-LOW. The old code passed ram_low, so every LOW-state
+     * adaptive kill (avail 8-15%) skipped the squeeze/ROI gates that
+     * by design only CRITICAL may bypass. */
+    bool ram_critical = ram_state_critical(mi);
     time_t now  = time(NULL);
 
     bool do_compact = false, rising = false;
@@ -4781,12 +5708,14 @@ static void adaptive_clean(ProcInfo *tbl, int cnt, MemInfo *mi, ZramInfo *z) {
             continue;
 
         long adaptive_reclaimed = 0;
-        if (should_spare_kill(p, ram_low, &adaptive_reclaimed)) {
+        if (should_spare_kill(p, ram_critical, &adaptive_reclaimed)) {
             freed_swap += adaptive_reclaimed;
             continue;
         }
 
-        if (kill(p->pid, SIGKILL) == 0) {
+        /* P0-1: verified SIGKILL */
+        int krc = kill_proc_verified(p);
+        if (krc == 0) {
             freed_swap += p->swap_kb + p->rss_kb / 4;
             kills++;
             record_kill(p);
@@ -4821,8 +5750,8 @@ static void adaptive_clean(ProcInfo *tbl, int cnt, MemInfo *mi, ZramInfo *z) {
  *  MAIN DAEMON LOOP
  * ================================================================ */
 static void signal_handler(int sig) {
-    logi("Signal %d – shutting down", sig);
-    g_running = false;
+    g_shutdown_signal = sig;
+    g_running = 0;
 }
 
 static void log_startup_banner(void) {
@@ -4850,9 +5779,9 @@ static void log_startup_banner(void) {
          IDLE_DETECT_S, IDLE_INTVL_S, IDLE_KILLS_MAX);
     logi("  Rank cache: %s saved every %ds (avg_swap warm-up after restart)",
          RANK_CACHE_FILE, RANK_CACHE_SAVE_S);
-    logi("  App ranking: 0=exempt 1=fg 2=hot(<%ds) 3=warm(<%dmin) "
-         "4=cold(<%dmin) 5=stale",
-         RANK_HOT_S, RANK_WARM_S/60, RANK_COLD_S/60);
+    logi("  App ranking: 0=exempt 1=tier1(<%ds) 2=tier2(<%dmin) "
+         "3=tier3 4=tier4/background",
+         RANK_HOT_S, RANK_COLD_S/60);
 
     logi("  Proactive launch squeeze: target %d%% (heavy app %d%%) on fg app "
          "switch — cgroup memory.high squeeze first, do_kill() fallback "
@@ -4987,9 +5916,9 @@ static void handle_true_foreground_detection(ProcInfo *tbl, int cnt,
         /* still in widget-settle grace — skip kills */
         return;
     }
-    char fg_name[256];
-    if (find_true_foreground(tbl, cnt, fg_name, sizeof(fg_name)) &&
-        strcmp(fg_name, g_true_fg_name) != 0) {
+    char fg_name[256] = {0};
+    bool found_fg = find_true_foreground(tbl, cnt, fg_name, sizeof(fg_name));
+    if (found_fg && strcmp(fg_name, g_true_fg_name) != 0) {
         /* Debounce: require the same candidate across consecutive
          * ticks before accepting it as a genuine fg change. Guards
          * against scan-order flicker when multiple procs share
@@ -5024,7 +5953,7 @@ static void handle_true_foreground_detection(ProcInfo *tbl, int cnt,
             g_pending_fg_streak = 0;
             g_pending_fg_name[0] = '\0';
         }
-    } else if (strcmp(fg_name, g_true_fg_name) == 0) {
+    } else if (found_fg && strcmp(fg_name, g_true_fg_name) == 0) {
         /* Candidate matches confirmed fg again — clear stale pending state */
         g_pending_fg_streak = 0;
         g_pending_fg_name[0] = '\0';
@@ -5112,23 +6041,26 @@ static void handle_zram_stage_management(ProcInfo *tbl, int cnt,
     }
 }
 
-/* RAM-pressure kill pass + adaptive loop-period tuning. Mirrors the
- * original inline logic's early-exit behavior exactly: when avail is
- * comfortably high or the kill cooldown hasn't elapsed, this returns
- * without touching *loop_sleep_us, leaving the previous tick's value
- * in place (same as the original bare `continue` skipping the tail
- * of the loop body). */
+/* RAM-pressure kill pass + adaptive loop-period tuning. Always update the
+ * poll interval before any pressure/cooldown early return, so healthy idle
+ * periods use the slower, lower-CPU cadence. */
 static void ram_pressure_and_adapt(ProcInfo *tbl, int cnt,
                                     MemInfo *mi, ZramInfo *z, time_t now,
                                     useconds_t *loop_sleep_us) {
+    bool calm = (mi->avail_pct >= FREE_LOW_PCT + 5) &&
+                (z->used_pct < ZRAM_WARN_PCT) &&
+                (now - g_last_fg_change_t) > 5;
+    *loop_sleep_us = calm ? 1500000 : 500000;
+
     int avail = mi->avail_pct;
     if (avail >= FREE_HIGH_PCT) return;
 
-    int cd = (avail < FREE_CRIT_PCT) ? 1 : 5;
+    /* P1-6: shared definition — see ram_state_critical(). */
+    int cd = ram_state_critical(mi) ? 1 : 5;
     if ((now - g_last_kill_t) < cd) return;
 
     long want, freed = 0;
-    if (avail < FREE_CRIT_PCT) {
+    if (ram_state_critical(mi)) {
         want = (long)g_total_ram_kb * FREE_LOW_PCT / 100 - mi->avail_kb;
         if (want < 64*1024) want = 64*1024;
         freed = do_kill(tbl, cnt, want, PRIO_SEMI_PROTECTED, true, avail);
@@ -5146,17 +6078,56 @@ static void ram_pressure_and_adapt(ProcInfo *tbl, int cnt,
         g_last_kill_t += 5;
     }
 
-    /* ── Adaptive tick: back off the loop period when calm so the
-     * full /proc scan + per-pid reads in enumerate_procs() don't
-     * burn CPU 2x/sec while the device is idle and healthy. Snap
-     * back to fast polling the instant pressure rises. ── */
-    bool calm = (mi->avail_pct >= FREE_LOW_PCT + 5) &&
-                (z->used_pct < ZRAM_WARN_PCT) &&
-                (now - g_last_fg_change_t) > 5;
-    *loop_sleep_us = calm ? 1500000 : 500000;
+}
+
+/* P1-8: LMKD PSI tuning is OPT-IN. Default startup no longer touches
+ * system LMKD configuration or restarts lmkd. Enabled by either:
+ *   - persist.lmk.psitune=1 system property, or
+ *   - psitune=1 line in /data/adb/lmk_engine.conf
+ * Rationale (documented per the TODO audit): ro.lmk.psi_partial_stall_ms
+ * sets the PSI window lmkd uses to declare memory pressure on low-RAM
+ * profiles; forcing 200ms + an lmkd restart changes system kill
+ * behaviour on every boot — that belongs behind an explicit user
+ * choice, not a silent default. */
+#define LMK_CONF_FILE "/data/adb/lmk_engine.conf"
+
+static bool config_flag_enabled(const char *key) {
+    /* 1) file config (simple "key=1" lines) */
+    FILE *f = fopen(LMK_CONF_FILE, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+            char *eq = strchr(line, '=');
+            if (!eq) continue;
+            *eq = 0;
+            if (strcmp(line, key) == 0 && strcmp(eq + 1, "1") == 0) {
+                fclose(f);
+                return true;
+            }
+        }
+        fclose(f);
+    }
+    /* 2) system property fallback */
+    char cmd[160], val[32] = {0};
+    snprintf(cmd, sizeof(cmd),
+             "getprop persist.lmk.%s 2>/dev/null", key);
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        if (!fgets(val, sizeof(val), fp)) val[0] = 0;
+        pclose(fp);
+    }
+    int len = (int)strlen(val);
+    while (len > 0 && (val[len-1] == '\n' || val[len-1] == '\r')) val[--len] = 0;
+    return strcmp(val, "1") == 0;
 }
 
 static void fix_lmkd_psi_stall(void) {
+    if (!config_flag_enabled("psitune")) {
+        logi("PSItune: disabled (opt-in) — enable with persist.lmk.psitune=1 "
+             "or psitune=1 in %s", LMK_CONF_FILE);
+        return;
+    }
     FILE *fp = popen("getprop ro.lmk.psi_partial_stall_ms 2>/dev/null", "r");
     char val[32] = {0};
     if (fp) { if (!fgets(val, sizeof(val), fp)) val[0] = 0; pclose(fp); }
@@ -5168,13 +6139,18 @@ static void fix_lmkd_psi_stall(void) {
         return;
     }
     logi("PSItune: ro.lmk.psi_partial_stall_ms=%s (expected 200ms low-ram "
-         "profile) — correcting and restarting lmkd to apply this boot",
+         "profile) — correcting and restarting lmkd to apply this boot "
+         "(opt-in via persist.lmk.psitune=1)",
          val[0] ? val : "(unset/default 70ms high-end profile)");
     if (system("resetprop ro.lmk.psi_partial_stall_ms 200 2>/dev/null") != 0)
         logw("PSItune: resetprop call failed — is Magisk's resetprop on PATH?");
-    if (system("stop lmkd 2>/dev/null; start lmkd 2>/dev/null") != 0)
-        logw("PSItune: lmkd restart command failed — value set but not "
-             "applied until next full reboot");
+    /* P1-8: check stop and start separately so a half-failed restart
+     * is visible in the log, and never blocks daemon startup. */
+    if (system("stop lmkd 2>/dev/null") != 0)
+        logw("PSItune: 'stop lmkd' failed — value set but not applied yet");
+    if (system("start lmkd 2>/dev/null") != 0)
+        logw("PSItune: 'start lmkd' failed — lmkd may be down until next "
+             "reboot; check 'getprop init.svc.lmkd'");
 }
 
 static void run_daemon(void) {
@@ -5184,7 +6160,12 @@ static void run_daemon(void) {
     wait_for_boot_settle();
 
     ProcInfo *tbl = malloc(2048 * sizeof(ProcInfo));
-    if (!tbl) { loge("malloc failed"); return; }
+    if (!tbl) {
+        loge("malloc failed");
+        logcat_watch_stop(&g_logcat_sys);
+        logcat_watch_stop(&g_logcat_events);
+        return;
+    }
 
     MemInfo mi;
     int  tick = 0;
@@ -5282,8 +6263,14 @@ static void run_daemon(void) {
         ram_pressure_and_adapt(tbl, cnt, &mi, &z, now, &loop_sleep_us);
     }
 
+    if (g_shutdown_signal)
+        logi("Signal %d – shutting down", (int)g_shutdown_signal);
     free(tbl);
     score_save();
+    /* SIGTERM -> bounded wait -> SIGKILL: never block in waitpid() on a
+     * logcat that has nothing new to write (the old pclose() hang). */
+    logcat_watch_stop(&g_logcat_sys);
+    logcat_watch_stop(&g_logcat_events);
     logi("LMK Engine stopped.");
 }
 
@@ -5533,7 +6520,12 @@ static void usage(const char *prog) {
 "  %s --explain <pkg> show what the daemon knows about one app\n"
 "  %s --log           tail live log\n"
 "  %s --swap <MB>     create & enable file swap\n"
-"  %s --delswap       remove file swap\n",
+"  %s --delswap       remove file swap\n"
+"\n"
+"Options (opt-in, default OFF):\n"
+"  PSItune  — set persist.lmk.psitune=1 or psitune=1 in\n"
+"             /data/adb/lmk_engine.conf to let the daemon tune\n"
+"             ro.lmk.psi_partial_stall_ms=200 and restart lmkd\n",
         LMK_VERSION, LMK_AUTHOR,
         prog, prog, prog, prog, prog, prog, prog, prog);
 }
@@ -5585,7 +6577,10 @@ int main(int argc, char *argv[]) {
                "   - Proactive launch squeeze (cgroup memory.high first, kill\n"
                "     fallback only for any shortfall), with warm-relaunch skip\n"
                "   - Adaptive main-loop polling (CPU backoff when calm)\n"
-               "   - ZRAM 3-attempt setup retry, cycle-safety guard, deferred resize\n");
+               "   - ZRAM staged bring-up with checked sysfs writes, bounded\n"
+               "     cycle recovery, deferred resize; device-scoped usage stats\n"
+               "   - v1.1: verified SIGKILL (pidfd), full-reset protection parity,\n"
+               "     memory.high lifecycle release triggers, opt-in LMKD PSItune\n");
         return 0;
     }
     if (!strcmp(cmd, "--log")) {
