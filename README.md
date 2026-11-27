@@ -1,51 +1,62 @@
-# lmk_engine
+# Ultimate Low Memory Killer Engine
 
-A custom userspace low-memory killer daemon for Android, written in pure C with no external dependencies. Runs alongside the stock low-memory killer, keeping the apps you actually use alive longer under memory pressure without the smoothness cost of killing indiscriminately.
+A lightweight userspace low-memory killer daemon for Android, written in pure C with zero external dependencies. `lmk_engine` runs alongside Android's stock `lmkd` to keep frequently used applications resident in memory under sustained pressure—without the CPU overhead of shell-based tweaks or the UI stutter caused by indiscriminate process kills.
 
-Built and tuned on an Infinix X683 (MT6768, 4GB RAM).
+---
 
-## What it does
+## Purpose
 
-- **App Pinning** - Keeps most-used apps alive under memory pressure, based on how you actually use your phone — not just what's most recent.
-- **Adaptive Clean** - Reclaims memory from background apps gradually, escalating only as pressure actually increases.
-- Manages ZRAM so the device stays usable even when RAM is chronically tight.
+Stock Android memory management relies primarily on static `oom_score_adj` tiers and strict Least Recently Used (LRU) ordering. On memory-constrained devices, this frequently evicts daily-driver apps the moment a heavy foreground task or background service spikes RAM usage. Meanwhile, common Magisk "RAM booster" modules rely on one-shot `sysctl` writes or polling shell scripts that spawn subshells and burn CPU cycles.
 
-For internal design, subsystem details, and the full list of tunable constants, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). For version history, see [`CHANGELOG.md`](CHANGELOG.md).
+`lmk_engine` solves this at the native daemon layer by combining behavioral app retention, graduated memory reclamation, and active ZRAM/swap management in a single compiled binary.
+
+---
+
+## How It Differs from Other Solutions
+
+| Aspect | Shell-Based RAM Modules | Stock Android `lmkd` | `lmk_engine` |
+| :--- | :--- | :--- | :--- |
+| **Runtime** | Shell loops (`sh`/`ash`) spawning external binaries | Native daemon (`lmkd`) | Single compiled C binary (no subshells or external libs) |
+| **Retention Logic** | Static `oom_score_adj` overrides or blind cache drops | Strictly recency-based (LRU) and OOM score tiers | Behavioral app pinning based on real usage patterns |
+| **Reclamation** | Periodic `drop_caches` (causes reload stutter) | Threshold-triggered kills | Graduated, multi-stage cleanup proportional to pressure |
+| **ZRAM & Swap** | Static boot-time ratios | Passive kernel paging | Active ZRAM awareness + on-demand swapfile provisioning |
+| **Observability** | None or raw logcat spam | Minimal kernel/logcat events | Built-in CLI diagnostics (`--status`, `--explain <pkg>`) |
+
+---
+
+## Key Features
+
+- **Behavioral App Pinning** — Tracks real foreground usage patterns to protect your most-used applications from premature eviction, rather than judging apps solely by last-opened timestamp.
+- **Graduated Adaptive Clean** — Reclaims memory from idle background processes incrementally as pressure rises, avoiding sudden mass kills that degrade frame pacing and responsiveness.
+- **RAM & ZRAM Footprint Awareness** — Evaluates both physical RSS and ZRAM consumption when selecting reclamation candidates, preventing compressed memory thrashing.
+- **System Partition Protection** — Distinguishes core OS components (`/system`, `/system_ext`, `/product`, `/vendor`, `/odm`, `/apex`) from third-party user apps to maintain system stability.
+- **ZRAM & Dynamic Swap Management** — Tunes ZRAM behavior and lets you allocate additional swap space on the fly when physical RAM is chronically tight.
+- **Per-Package Introspection** — Inspect why any specific app is pinned, scored, or targeted for reclamation in real time using `--explain <pkg>`.
+
+---
 
 ## Requirements
 
-- Rooted Android device 
-- clang or gcc to build
+- Rooted Android device (Magisk, KernelSU, or APatch)
+- `clang` or `gcc` (only required if compiling from source)
 
-## Building
+---
+
+## Installation
+
+1. Download the latest release ZIP from [**Releases**](../../releases).
+2. Flash the ZIP in your root manager (Magisk, KernelSU, or APatch) and reboot.
+
+---
+
+## Building from Source
+
+Compile the daemon directly on-device (e.g., via Termux) or with an Android NDK toolchain:
 
 ```bash
 clang -O2 -Wall -Wextra -o lmk_engine src/lmk_engine.c -lm
 ```
 
-## Installing
-
-Flash a release zip from [Releases](../../releases), or zip the `module/` folder yourself and flash it via Magisk Manager, then reboot.
-
-## Usage
-
-It works automatically after flashing the module, but you can run this in the terminal for diagnostics:
-
-```
-lmk_engine --start              start the daemon
-lmk_engine --stop               stop the daemon
-lmk_engine --status             show memory/ZRAM/swap/pin status
-lmk_engine --log                tail the live log
-lmk_engine --swap <size in mb>  add swap
-lmk_engine --explain <pkg>      see what the daemon knows about one app
-```
-
 ## License
 
 MIT — see `LICENSE`.
-
-## Disclaimer 
-
-Tbh though if your phone is shit, this Daemon will struggle to keep apps open, for reducing the struggles or smth you can either increase the zram percentage and build using GitHub actions, or add a swap file using the terminal commands `lmk_engine --swap <amount of swap needed in megabytes>`
-e.g `lmk_engine --swap 1024`
-*commands must be run with root*
