@@ -35,6 +35,43 @@ Stock Android memory management relies primarily on static `oom_score_adj` tiers
 
 ---
 
+## How It Works
+
+```text
+Boot (Magisk / KernelSU / APatch)
+  ├── Applies system.prop (relaxes stock lmkd thresholds)
+  └── Starts lmk_engine daemon
+            │
+            ▼
+  [1. Classification & Pinning] ──► Separates system partitions from user apps
+            │                       Tracks foreground usage to pin frequent apps
+            ▼
+  [2. Pressure Monitoring]      ──► Samples available RAM, ZRAM usage, and swap headroom
+            │
+            ▼
+  [3. Adaptive Clean]           ──► Incrementally kills unpinned background apps by RAM/ZRAM cost
+            │                       Preserves pinned apps; stock lmkd remains as failsafe
+            ▼
+  [4. ZRAM & Swap Balancing]    ──► Manages ZRAM and utilizes backing swapfile when configured
+```
+
+---
+
+## Usage
+
+It works automatically after flashing the module, but you can run this in the terminal for diagnostics:
+
+```
+lmk_engine --start              start the daemon
+lmk_engine --stop               stop the daemon
+lmk_engine --status             show memory/ZRAM/swap/pin status
+lmk_engine --log                tail the live log
+lmk_engine --swap <size in mb>  add swap
+lmk_engine --explain <pkg>      see what the daemon knows about one app
+```
+
+---
+
 ## Requirements
 
 - Rooted Android device (Magisk, KernelSU, or APatch)
