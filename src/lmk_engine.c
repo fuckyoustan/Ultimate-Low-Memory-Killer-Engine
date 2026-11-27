@@ -29,7 +29,7 @@
 #include <poll.h>
 #include <math.h>
 
-#define LMK_VERSION   "1.1"
+#define LMK_VERSION   "1.0"
 #define LMK_AUTHOR    "@fuckyoustan & P34"
 
 /* Memory pressure thresholds */
