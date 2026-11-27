@@ -2664,7 +2664,10 @@ static ClassifyTry classify_try(const char *pkg, bool *is_system) {
         any_ran = true;
         if (code != 0) continue;
         bool parsed = false;
-        for (char *line = strtok(out, "\n"); line; line = strtok(NULL, "\n")) {
+        char *saveptr = NULL;
+        for (char *line = strtok_r(out, "\r\n", &saveptr);
+             line != NULL;
+             line = strtok_r(NULL, "\r\n", &saveptr)) {
             if (strncmp(line, "package:", 8) != 0) continue;
             parsed = true;
             const char *path = line + 8;
