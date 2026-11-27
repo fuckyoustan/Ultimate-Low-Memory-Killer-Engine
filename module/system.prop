@@ -1,0 +1,6 @@
+ro.lmk.thrashing_limit=200
+ro.lmk.thrashing_limit_decay=30
+ro.lmk.swap_free_low_percentage=5
+ro.lmk.use_minfree_levels=false
+ro.lmk.psi_partial_stall_ms=200
+ro.lmk.psi_complete_stall_ms=700
