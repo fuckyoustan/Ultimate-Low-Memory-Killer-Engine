@@ -103,7 +103,7 @@
 
 /* Rank cache: avg_swap_kb and rank are saved every RANK_CACHE_SAVE_S and loaded at startup, so cmp_killable_zram targets high-swap apps right after a restart. */
 #define RANK_CACHE_FILE  "/data/local/tmp/lmk_rank.cache"
-#define RANK_CACHE_SAVE_S  10
+#define RANK_CACHE_SAVE_S  60
 
 /* Idle mode: after IDLE_DETECT_S without a foreground change, run a gentle COLD+STALE sweep (up to IDLE_KILLS_MAX every IDLE_INTVL_S), only when RAM isn't under pressure. */
 #define IDLE_DETECT_S     300   /* seconds of no fg change = idle      */
@@ -322,7 +322,8 @@ static time_t g_last_deepclean    = 0;   /* timestamp of last deep clean  */
 
 #define RESET_GATE_S       (12*3600)  /* min time since boot/last reset  */
 static time_t g_last_full_reset_t = 0;   /* 0 = not done yet this boot   */
-static bool   g_reset_in_progress = false; /* tells check_bounced() this kill was scheduled, not organic instability */
+static bool   g_reset_in_progress = false; /* tells sync_proc_bounce_state() this kill was scheduled, not organic instability */
+static time_t g_last_hist_kill_t  = 0;     /* newest record_kill() time; 0 = none yet */
 
 #define START_TIME_FILE  "/data/local/tmp/lmk_engine.start"
 
@@ -351,7 +352,8 @@ static time_t g_deepclean_pause_until = 0; /* pause end timestamp          */
 
 #define FG_COUNT_MAX        100000
 #define FG_COUNT_SCALE      100
-#define SCORE_SAVE_INTVL    15
+#define SCORE_SAVE_INTVL    60
+#define SWAP_EMA_PERSIST_KB 8192   /* smaller swap EMA moves stay in memory, no journal write */
 #define SCORE_AVG_ALPHA_PCT  25   /* EMA weight for new sample (25%)  */
 
 #define GROWTH_WINDOW_S        600    /* sample window: 10 min             */
@@ -547,7 +549,9 @@ static void log_rotate(void) {
 }
 __attribute__((format(printf, 2, 0)))
 static void _log(const char *tag, const char *fmt, va_list ap) {
-    log_rotate();                                  /* may replace g_log   */
+    static unsigned log_lines = 0;
+    static time_t last_flush = 0;
+    if ((++log_lines & 63) == 0 || (!g_log && g_log_reopen_after != 0)) log_rotate();   /* may replace g_log */
     FILE *fp = g_log ? g_log : stderr;             /* fetched AFTER rotate */
     time_t now = time(NULL);
     struct tm tmv, *t = localtime_r(&now, &tmv);
@@ -555,7 +559,9 @@ static void _log(const char *tag, const char *fmt, va_list ap) {
     if (!t || strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", t) == 0)
         snprintf(ts, sizeof(ts), "00-00 00:00:00");   /* localtime failed */
     fprintf(fp, "[%s][%s] ", ts, tag);
-    vfprintf(fp, fmt, ap); fputc('\n', fp); fflush(fp);
+    vfprintf(fp, fmt, ap); fputc('\n', fp);
+    /* Flush KILL/ERROR at once; the rest rides the libc buffer but is flushed at least every 2 s so --log stays live. */
+    if (tag[0] == 'K' || tag[0] == 'E' || now - last_flush >= 2) { fflush(fp); last_flush = now; }
 }
 #define DEFLOG(fn,tag) \
     __attribute__((format(printf, 1, 2))) \
@@ -1143,19 +1149,31 @@ static unsigned long read_proc_cpu_jiffies(pid_t pid) {
 
 static unsigned long long read_proc_starttime(pid_t pid) {
     char path[64]; snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
     char buf[512];
-    if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
-    fclose(f);
+    ssize_t n;
+    do { n = read(fd, buf, sizeof(buf) - 1); } while (n < 0 && errno == EINTR);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    /* comm may contain spaces and ')', so anchor on the last ')'; fields 3..21 follow, starttime is field 22. */
     char *p = strrchr(buf, ')');
     if (!p) return 0;
-    unsigned long long starttime = 0;
-    int n = sscanf(p + 2,
-        "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu",
-        &starttime);
-    if (n != 1) return 0;
-    return starttime;
+    p++;
+    for (int f = 3; f <= 21; f++) {
+        while (*p == ' ') p++;
+        if (!*p) return 0;
+        while (*p && *p != ' ') p++;
+    }
+    while (*p == ' ') p++;
+    if (!isdigit((unsigned char)*p)) return 0;
+    errno = 0;
+    char *end;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p || errno != 0) return 0;
+    if (*end == '\0' && n == (ssize_t)sizeof(buf) - 1) return 0;   /* read cut inside the number */
+    return v;
 }
 
 /* Every SIGKILL goes through kill_proc_verified(): the snapshot starttime must match live /proc/<pid>/stat, otherwise the PID was recycled and is not signalled.
@@ -1677,6 +1695,7 @@ static double psi_mem_avg10(void) {
 /* PSI event-driven monitor */
 
 static int g_psi_fd = -1;
+#define PSI_WAKE_COOLDOWN_MS 350.0
 
 static void psi_monitor_init(void) {
     if (!g_psi_available) return;
@@ -1694,24 +1713,28 @@ static void psi_monitor_init(void) {
         return;
     }
 
-    const char trig_some[] = "some 70000 1000000";
-    if (write(fd, trig_some, sizeof(trig_some)) < 0) {
-        logw("PSI: 'some' trigger register failed (%s) — 'full' trigger "
-             "still armed", strerror(errno));
-    }
     g_psi_fd = fd;
-    logi("PSI: event monitor armed (full-stall >100ms/1s + partial-stall "
-         ">70ms/1s window, speculative threshold)");
+    logi("PSI: event monitor armed (full-stall >100ms/1s; partial-stall trigger dropped to avoid wake-up storms)");
 }
 
 /* Sleeps up to sleep_us but wakes at once if the PSI trigger fires; plain usleep() when the monitor isn't armed (g_psi_fd < 0). */
 static bool wait_for_next_tick(useconds_t sleep_us) {
     if (g_psi_fd < 0) { usleep(sleep_us); return false; }
+
+    /* Wake-up cooldown: right after a PSI wake-up, sleep normally instead of polling again, so a persistent trigger can't busy-loop. */
+    static struct timespec last_psi_wake = {0, 0};
+    struct timespec nowts; clock_gettime(CLOCK_MONOTONIC, &nowts);
+    if (last_psi_wake.tv_sec != 0 && ts_diff_ms(&last_psi_wake, &nowts) < PSI_WAKE_COOLDOWN_MS) {
+        usleep(sleep_us);
+        return false;
+    }
     struct pollfd pfd = { .fd = g_psi_fd, .events = POLLPRI };
     int timeout_ms = (int)(sleep_us / 1000);
     if (timeout_ms < 1) timeout_ms = 1;
     int r = poll(&pfd, 1, timeout_ms);
     if (r > 0 && (pfd.revents & POLLPRI)) {
+        clock_gettime(CLOCK_MONOTONIC, &last_psi_wake);
+        if (last_psi_wake.tv_sec == 0) last_psi_wake.tv_sec = 1;
         static time_t last_log = 0;
         time_t now = time(NULL);
         if (now - last_log >= LOG_RATELIMIT_S) {
@@ -2224,6 +2247,7 @@ static void record_kill(ProcInfo *p) {
     time_t now = time(NULL);
     const char *name = p->name;
 
+    g_last_hist_kill_t = now;
     kswapd_note_disruptive_event();
 
     for (int i = 0; i < KILL_HIST_SIZE; i++) {
@@ -2240,35 +2264,6 @@ static void record_kill(ProcInfo *p) {
     g_kill_hist[g_kill_hist_idx].bounced     = false;
     g_kill_hist[g_kill_hist_idx].scheduled   = g_reset_in_progress;
     g_kill_hist_idx = (g_kill_hist_idx + 1) % KILL_HIST_SIZE;
-}
-
-static void check_bounced(const char *name) {
-    time_t now = time(NULL);
-    for (int i = 0; i < KILL_HIST_SIZE; i++) {
-        if (g_kill_hist[i].name[0] &&
-            strcmp(g_kill_hist[i].name, name) == 0 &&
-            !g_kill_hist[i].bounced &&
-            (now - g_kill_hist[i].killed_at) < RESTART_WINDOW_S) {
-            g_kill_hist[i].bounced = true;
-            if (g_kill_hist[i].scheduled) {
-
-                continue;
-            }
-            for (int j = 0; j < g_score_count; j++) {
-                if (strcmp(g_scores[j].name, name) == 0) {
-                    g_scores[j].restart_count++;
-                    g_scores[j].last_restart_t = now;
-                    g_scores[j].dirty = true;
-                    g_scores_dirty = true;
-                    logi("Resilient: %s restart_count=%d (cd=%ds)",
-                         name, g_scores[j].restart_count,
-                         kill_cooldown_for(name));
-                    break;
-                }
-            }
-            break;
-        }
-    }
 }
 
 /* System/user package cache from PackageManager: both lists (-s, -3) are cached at once, so classify_dumpsys_drain() confirms nearly every package
@@ -2934,7 +2929,7 @@ static void score_touch(const char *name, time_t now, long swap_kb) {
         s->avg_swap_kb = (s->avg_swap_kb * (100 - SCORE_AVG_ALPHA_PCT) +
                           swap_kb * SCORE_AVG_ALPHA_PCT) / 100;
         /* Only a meaningful swap move is worth persisting, not per-tick EMA noise. */
-        if (labs(s->avg_swap_kb - old_avg) >= 1024) {
+        if (labs(s->avg_swap_kb - old_avg) >= SWAP_EMA_PERSIST_KB) {
             s->dirty = true;
             g_scores_dirty = true;
         }
@@ -2951,7 +2946,7 @@ static void score_touch_bg(const char *name, time_t now, long swap_kb) {
         long old_avg = s->avg_swap_kb;
         s->avg_swap_kb = (s->avg_swap_kb * (100 - SCORE_AVG_ALPHA_PCT) +
                           swap_kb * SCORE_AVG_ALPHA_PCT) / 100;
-        if (labs(s->avg_swap_kb - old_avg) >= 1024) {
+        if (labs(s->avg_swap_kb - old_avg) >= SWAP_EMA_PERSIST_KB) {
             s->dirty = true;
             g_scores_dirty = true;
         }
@@ -3734,14 +3729,37 @@ static void check_proc_runaway(ProcInfo *p) {
                 p->prio = PRIO_JUNK;
         }
 }
-static void track_proc_bounce_window(ProcInfo *p, time_t now) {
-    p->bounce_count  = 0;
-    p->bounce_first  = 0;
+/* One pass over the kill history: marks a bounce (restart within RESTART_WINDOW_S) and fills the per-process bounce window.
+ * Skipped outright when no kill is recent enough to matter. */
+static void sync_proc_bounce_state(ProcInfo *p, time_t now) {
+    p->bounce_count = 0;
+    p->bounce_first = 0;
+    if (g_last_hist_kill_t == 0 || (now - g_last_hist_kill_t) > BOUNCE_KILL_CD_MAX_S) return;
+
+    bool bounce_done = false;
     for (int i = 0; i < KILL_HIST_SIZE; i++) {
-        if (g_kill_hist[i].name[0] &&
-            strcmp(g_kill_hist[i].name, p->name) == 0 &&
-            (now - g_kill_hist[i].killed_at) < BOUNCE_WINDOW_S) {
-            if (p->bounce_count == 0) p->bounce_first = g_kill_hist[i].killed_at;
+        KillRecord *k = &g_kill_hist[i];
+        if (!k->name[0] || strcmp(k->name, p->name) != 0) continue;
+        time_t age = now - k->killed_at;
+
+        if (!bounce_done && !k->bounced && age < RESTART_WINDOW_S) {
+            k->bounced = true;
+            if (!k->scheduled) {
+                bounce_done = true;
+                for (int j = 0; j < g_score_count; j++) {
+                    if (strcmp(g_scores[j].name, p->name) != 0) continue;
+                    g_scores[j].restart_count++;
+                    g_scores[j].last_restart_t = now;
+                    g_scores[j].dirty = true;
+                    g_scores_dirty = true;
+                    logi("Resilient: %s restart_count=%d (cd=%ds)",
+                         p->name, g_scores[j].restart_count, kill_cooldown_for(p->name));
+                    break;
+                }
+            }
+        }
+        if (age < BOUNCE_WINDOW_S) {
+            if (p->bounce_count == 0) p->bounce_first = k->killed_at;
             p->bounce_count++;
         }
     }
@@ -3804,23 +3822,39 @@ static int enumerate_procs(ProcInfo *tbl, int maxn) {
     g_rank_seq++;
     DIR *dir = opendir("/proc"); if (!dir) return -1;
     int cnt = 0; struct dirent *de;
+    time_t now = time(NULL);
     while ((de = readdir(dir)) && cnt < maxn) {
         if (!isdigit((unsigned char)de->d_name[0])) continue;
         pid_t pid = (pid_t)atol(de->d_name); if (pid <= 1) continue;
         ProcInfo *p = &tbl[cnt]; memset(p, 0, sizeof(*p)); p->pid = pid;
-        /* Bracket every /proc/<pid> read with a starttime sample before and after; a mismatch (recycled PID) or 0 (gone) drops the entry so no snapshot mixes two processes.
-         * Global-state side effects run only after the snapshot is verified. */
-        unsigned long long st_before = read_proc_starttime(pid);
-        if (st_before == 0) continue;
+
+        /* Kernel threads have an empty cmdline: dropped before /stat or /status is ever opened. */
         if (proc_cmdline(pid, p->name, sizeof(p->name)) < 0) continue;
         if (!p->name[0]) continue;
-        p->oom_adj       = proc_oom_adj(pid);
+
+        /* System/root and exempt processes are never kill targets: no starttime, no /status read. */
+        p->oom_adj = proc_oom_adj(pid);
+        if (p->oom_adj < 0 || is_rank_exempt(p->name)) {
+            p->prio = PRIO_NEVER;
+            p->rank = RANK_EXEMPT;
+            cnt++;
+            continue;
+        }
+
+        /* Candidate: sample starttime, then re-read cmdline and oom_adj so the name and adj
+         * belong to the verified process, and re-check starttime after the last read.
+         * A mismatch (recycled PID) or 0 (gone) drops the entry. */
+        unsigned long long st_before = read_proc_starttime(pid);
+        if (st_before == 0) continue;
+        char name2[sizeof(p->name)];
+        if (proc_cmdline(pid, name2, sizeof(name2)) < 0 || strcmp(name2, p->name) != 0) continue;
+        p->oom_adj = proc_oom_adj(pid);
         proc_mem_stats(pid, &p->rss_kb, &p->swap_kb);
         if (read_proc_starttime(pid) != st_before) continue;  /* recycled / exited */
         p->starttime     = st_before;   /* identity used by kill_proc_verified() */
         p->prio          = classify(p);
         p->raw_last_fg_do_not_read_directly       = get_last_fg(p->name);
-        check_bounced(p->name);
+        sync_proc_bounce_state(p, now);
 
         AppScore *as = lookup_or_create_score_stub(p);
 
@@ -3833,9 +3867,6 @@ static int enumerate_procs(ProcInfo *tbl, int maxn) {
 
         compute_proc_rank(p, as);
         check_proc_runaway(p);
-
-        time_t now = time(NULL);
-        track_proc_bounce_window(p, now);
         cnt++;
     }
     closedir(dir);
@@ -4539,7 +4570,15 @@ static void logcat_drain_and_attribute(LogcatWatch *w,
 }
 
 /* Drains buffered logcat output (bounded per tick) and matches kill-looking lines against live tracked apps; observation only, never a kill decision. */
+static bool config_flag_enabled(const char *key);
+
 static void logcat_kill_watch(ProcInfo *tbl, int cnt) {
+    /* Opt-in (logcatwatch=1): without it no logcat child is spawned; unattrib_check_vanished() still tracks vanished processes. */
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = config_flag_enabled("logcatwatch") ? 1 : 0;
+    if (!enabled) return;
+
     logcat_watch_init();
 
     logcat_drain_and_attribute(&g_logcat_sys, tbl, cnt, "system");
@@ -5853,7 +5892,8 @@ static void ram_pressure_and_adapt(ProcInfo *tbl, int cnt,
     bool calm = (mi->avail_pct >= FREE_LOW_PCT + 5) &&
                 (z->used_pct < ZRAM_WARN_PCT) &&
                 (now - g_last_fg_change_t) > 5;
-    *loop_sleep_us = calm ? 1500000 : 500000;
+    /* Calm: 3 s with the screen off, 2 s with it on; any pressure or recent app switch polls every 600 ms. */
+    *loop_sleep_us = !calm ? 600000 : (g_screen_off_since > 0 ? 3000000 : 2000000);
 
     int avail = mi->avail_pct;
     if (avail >= FREE_HIGH_PCT) return;
@@ -5964,7 +6004,7 @@ static void run_daemon(void) {
     int  tick = 0;
     time_t last_zram_cycle  = 0;
     time_t last_drop_caches = 0;
-    useconds_t loop_sleep_us = 500000; /* adaptive: 500ms busy, up to 1.5s calm */
+    useconds_t loop_sleep_us = 600000; /* adaptive: 600ms busy, 2-3s calm */
 
     double prof_enum_ms = 0, prof_pin_ms = 0, prof_adapt_ms = 0, prof_zram_ms = 0;
 
@@ -6707,7 +6747,10 @@ static void usage(const char *prog) {
 "Options (opt-in, default OFF):\n"
 "  PSItune  — set persist.lmk.psitune=1 or psitune=1 in\n"
 "             /data/adb/lmk_engine.conf to let the daemon tune\n"
-"             ro.lmk.psi_partial_stall_ms=200 and restart lmkd\n",
+"             ro.lmk.psi_partial_stall_ms=200 and restart lmkd\n"
+"  logcatwatch — set logcatwatch=1 in /data/adb/lmk_engine.conf to\n"
+"             spawn logcat watchers for external-kill attribution\n"
+"             (off by default, saves two background processes)\n",
         LMK_VERSION, LMK_AUTHOR,
         prog, prog, prog, prog, prog, prog, prog, prog);
 }
